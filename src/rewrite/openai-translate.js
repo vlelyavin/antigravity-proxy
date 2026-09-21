@@ -63,6 +63,13 @@ function partsFromContent(content) {
           throw error;
         }
         // other schemes: ignore silently (unchanged behavior)
+      } else if (item?.type === 'file_uri' && item.fileUri) {
+        // native Gemini fileData passthrough (from gemini-native.js)
+        const fd = { fileUri: item.fileUri };
+        if (item.mimeType) fd.mimeType = item.mimeType;
+        const part = { fileData: fd };
+        if (item.videoMetadata) part.videoMetadata = item.videoMetadata;
+        parts.push(part);
       }
     }
     return parts;

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { geminiNativeToOpenAi, antigravityToGeminiNative } from '../src/rewrite/gemini-native.js';
+import { openAiToAntigravity } from '../src/rewrite/openai-translate.js';
 
 test('native request with systemInstruction + inlineData maps to OpenAI body', () => {
   const native = {
@@ -33,14 +34,25 @@ test('google/ prefix stripped by caller via canonicalModel; native passthrough o
   assert.equal(native.usageMetadata.promptTokenCount, 3);
 });
 
-test('fileData video part maps to image_url placeholder (no fetch), model role maps to assistant', () => {
+test('fileData passes through roundtrip: native -> openai marker -> antigravity fileData part', () => {
   const native = {
     contents: [
       { role: 'model', parts: [{ text: 'earlier' }] },
-      { role: 'user', parts: [{ fileData: { fileUri: 'https://x/y.mp4', mimeType: 'video/mp4' } }, { text: 'what happens' }] },
+      { role: 'user', parts: [{ fileData: { fileUri: 'https://x/y.mp4', mimeType: 'video/mp4' }, videoMetadata: { fps: 1 } }, { text: 'what happens' }] },
     ],
   };
   const openai = geminiNativeToOpenAi(native, { model: 'm' });
   assert.equal(openai.messages[0].role, 'assistant');
-  assert.deepEqual(openai.messages[1].content, [{ type: 'text', text: 'what happens' }]);
+  assert.deepEqual(openai.messages[1].content, [
+    { type: 'file_uri', fileUri: 'https://x/y.mp4', mimeType: 'video/mp4', videoMetadata: { fps: 1 } },
+    { type: 'text', text: 'what happens' },
+  ]);
+
+  const agy = openAiToAntigravity(openai, { projectId: 'p', sessionId: 's' });
+  const parts = agy.request.contents[1].parts;
+  assert.deepEqual(parts[0], {
+    fileData: { fileUri: 'https://x/y.mp4', mimeType: 'video/mp4' },
+    videoMetadata: { fps: 1 },
+  });
+  assert.deepEqual(parts[1], { text: 'what happens' });
 });
