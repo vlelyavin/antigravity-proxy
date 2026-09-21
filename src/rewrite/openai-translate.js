@@ -9,6 +9,26 @@ import { findModel } from './models.js';
 // like CLIProxyAPI we replay with the backend's own bypass marker.
 export const THOUGHT_SIGNATURE_BYPASS = 'skip_thought_signature_validator';
 
+// Google function declarations take scalar "type" strings; OpenAI-style
+// unions ("type": ["string","null"]) are rejected by the upstream proto
+// ("Proto field is not repeating, cannot start list"). Collapse unions to the
+// first non-null type — the enum-null wire constraint from the CPA era
+// (mari sessions report antigravity-verify-2026-09-21).
+function normalizeSchemaTypes(node) {
+  if (Array.isArray(node)) return node.map(normalizeSchemaTypes);
+  if (!node || typeof node !== 'object') return node;
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'type' && Array.isArray(value)) {
+      const scalar = value.find((t) => t !== 'null') ?? value[0];
+      out.type = scalar;
+      continue;
+    }
+    out[key] = normalizeSchemaTypes(value);
+  }
+  return out;
+}
+
 const STOP_MAP = {
   STOP: 'stop',
   MAX_TOKENS: 'length',
@@ -138,7 +158,7 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
         fns.push({
           name: tool.function.name,
           description: tool.function.description || '',
-          parameters: tool.function.parameters || { type: 'object', properties: {} },
+          parameters: normalizeSchemaTypes(tool.function.parameters || { type: 'object', properties: {} }),
         });
       }
     }
