@@ -50,7 +50,9 @@ function partsFromContent(content) {
   return [];
 }
 
-export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice }, { projectId, sessionId }) {
+const EFFORT_BUDGET = { low: 1000, medium: 4000, high: -1 };
+
+export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort }, { projectId, sessionId }) {
   const catalogEntry = findModel(model);
   const budget = Number.isFinite(max_tokens) ? max_tokens : max_completion_tokens;
   const contents = [];
@@ -105,9 +107,13 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     generationConfig.maxOutputTokens = Number.isFinite(budget)
       ? budget
       : catalogEntry.maxOutputTokens;
+    // reasoning_effort overrides the model-suffix budget (CPA parity: the Mari
+    // lane pins effort=low on a -high model and expects ~0 reasoning tokens)
+    const effortBudget = reasoning_effort in EFFORT_BUDGET ? EFFORT_BUDGET[reasoning_effort] : null;
+    const thinkingBudget = effortBudget ?? catalogEntry.budget;
     generationConfig.thinkingConfig = {
-      includeThoughts: true,
-      thinkingBudget: catalogEntry.budget,
+      includeThoughts: thinkingBudget !== 0,
+      thinkingBudget,
     };
   } else {
     if (Number.isFinite(budget)) generationConfig.maxOutputTokens = budget;
