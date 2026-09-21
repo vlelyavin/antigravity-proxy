@@ -6,7 +6,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
 
 export function checkApiKey(config, req) {
-  if (!config.apiKey) return true;
+  // "none" (string) is a documented no-key value, same as unset
+  if (!config.apiKey || config.apiKey === 'none') return true;
   const header = req.headers.authorization || '';
   const bearer = header.startsWith('Bearer ') ? header.slice(7) : null;
   const xKey = req.headers['x-api-key'] || null;
