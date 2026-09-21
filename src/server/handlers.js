@@ -27,7 +27,7 @@ export function errorResponse(res, status, message, type = 'invalid_request_erro
 }
 
 /** Runs an OpenAI-shaped request through the pool with rotation on quota/auth. */
-export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal }) {
+export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal, respondNative = false }) {
   const accounts = store.readAll();
   const maxAttempts = Math.min(accounts.length, 3);
   let lastError = null;
@@ -42,7 +42,7 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
       if (openAiBody.stream) {
         await handleStream({ upstream, config, logger, account, openAiBody, res, signal });
       } else {
-        await handleNonStream({ upstream, config, logger, account, openAiBody, res, signal });
+        await handleNonStream({ upstream, config, logger, account, openAiBody, res, signal, respondNative });
       }
       return;
     } catch (error) {
@@ -65,9 +65,18 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
   throw lastError ?? new UpstreamError('no accounts available', { status: 502 });
 }
 
-async function handleNonStream({ upstream, logger, account, openAiBody, res, signal }) {
+async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false }) {
   const upstreamResponse = await upstream.generate({ openAiBody, account, signal });
   const json = await upstreamResponse.json();
+  if (respondNative) {
+    const { antigravityToGeminiNative } = await import('../rewrite/gemini-native.js');
+    const nativeJson = antigravityToGeminiNative(json);
+    const body = JSON.stringify(nativeJson);
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+    res.end(body);
+    logger.info('native.completed', { model: openAiBody.model, account: account.email || account.id });
+    return;
+  }
   const openAiJson = antigravityToOpenAi(json, { model: openAiBody.model });
   const body = JSON.stringify(openAiJson);
   res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });

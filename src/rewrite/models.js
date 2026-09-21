@@ -28,6 +28,16 @@ export const MODEL_CATALOG = [
 ];
 
 export function findModel(id) {
+  // bare family names ("gemini-3.8-flash", "gemini-3.1-pro") resolve to the
+  // medium effort of that family — CPA-compatible for callers that omit the
+  // -low/-medium/-high suffix (Mari vision lane does).
+  const bare = /^((?:gemini-\d+(?:\.\d+)?-(?:flash|pro))|claude-(?:sonnet|opus)-\d+-\d+)$/.exec(id);
+  if (bare) {
+    const family = MODEL_CATALOG.filter((m) => m.id.startsWith(`${bare[1]}-`));
+    return family.find((m) => m.id.endsWith('-medium'))
+      ?? family.find((m) => m.id.endsWith('-high'))
+      ?? family[0] ?? MODEL_CATALOG.find((m) => m.id === id) ?? null;
+  }
   return MODEL_CATALOG.find((m) => m.id === id) ?? null;
 }
 

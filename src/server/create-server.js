@@ -112,6 +112,44 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
       return;
     }
 
+    // native Gemini generateContent (CPA parity): /v1beta/models/{model}:generateContent
+    const nativeMatch = /^(?:\/v1beta\/models\/|\/v1\/(?:beta\/)?models\/)([^/:]+):generateContent$/.exec(url.pathname);
+    if (req.method === 'POST' && nativeMatch) {
+      if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
+      let nativeBody;
+      try {
+        nativeBody = JSON.parse(await readBody(req));
+      } catch (error) {
+        return errorResponse(res, 400, `invalid JSON body: ${error.message}`);
+      }
+      const model = decodeURIComponent(nativeMatch[1]);
+      const { geminiNativeToOpenAi } = await import('../rewrite/gemini-native.js');
+      const openAiBody = geminiNativeToOpenAi(nativeBody, { model });
+      if (openAiBody.messages.length === 0) {
+        return errorResponse(res, 400, 'contents must be a non-empty array');
+      }
+      const clientAbort = new AbortController();
+      req.on('close', () => { if (!res.writableEnded) clientAbort.abort(new Error('client disconnected')); });
+      try {
+        await handleWithRotation({
+          pool, store: credentialStore, upstream, config, logger,
+          openAiBody, req, res, signal: clientAbort.signal,
+          respondNative: true,
+        });
+      } catch (error) {
+        if (clientAbort.signal.aborted) {
+          logger.warn('native.client_aborted', { model });
+          return;
+        }
+        const status = error instanceof UpstreamError ? error.status : (error.status === 400 ? 400 : 502);
+        logger.error('native.failed', { status, error: error.message });
+        if (!res.headersSent) {
+          errorResponse(res, status, error.message, status === 429 ? 'rate_limit_error' : 'server_error');
+        } else res.end();
+      }
+      return;
+    }
+
     errorResponse(res, 404, `no route for ${req.method} ${url.pathname}`);
   }
 
