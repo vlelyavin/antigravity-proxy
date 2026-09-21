@@ -173,7 +173,7 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
   }
 
   return {
-    model: catalogEntry?.upstreamModel ?? model,
+    model: catalogEntry ? (catalogEntry.upstreamModel ?? catalogEntry.id) : model,
     userAgent: 'antigravity',
     requestType: 'agent',
     project: projectId,
