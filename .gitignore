@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+config.json
+.env
+.env.*
+*-token
+accounts/

@@ -1,0 +1,13 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 8317 },
+  "logLevel": "info",
+  "apiKey": null,
+  "credentials": {
+    "searchPaths": [
+      "~/.gemini/antigravity-cli/antigravity-oauth-token",
+      "~/.gemini/oauth_creds.json",
+      "~/.antigravity-proxy/accounts/*.json"
+    ]
+  },
+  "rotation": { "cooldownMs": 60000 }
+}

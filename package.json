@@ -1,0 +1,34 @@
+{
+  "name": "antigravity-proxy",
+  "version": "0.1.0",
+  "description": "Local relay that lets OpenAI-compatible tooling use Google AI Pro / Antigravity subscription OAuth",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "homepage": "https://github.com/vlelyavin/antigravity-proxy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vlelyavin/antigravity-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vlelyavin/antigravity-proxy/issues"
+  },
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "google-ai-pro",
+    "oauth",
+    "openai-compatible",
+    "proxy",
+    "relay",
+    "sse"
+  ],
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test",
+    "health": "curl -sS http://127.0.0.1:8317/health"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
