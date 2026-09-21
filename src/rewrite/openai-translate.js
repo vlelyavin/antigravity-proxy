@@ -24,6 +24,13 @@ function normalizeSchemaTypes(node) {
       out.type = scalar;
       continue;
     }
+    if (key === 'anyOf' && Array.isArray(value)) {
+      // Claude-side validation bridge (Vertex) rejects anyOf outright even though
+      // draft 2020-12 allows it; oneOf passes. Union semantics for tool input
+      // validation are interchangeable here, so rewrite anyOf → oneOf.
+      out.oneOf = normalizeSchemaTypes(value);
+      continue;
+    }
     out[key] = normalizeSchemaTypes(value);
   }
   return out;
@@ -94,11 +101,14 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     }
     if (role === 'tool') {
       // tool result feeds back as a functionResponse part
+      // The antigravity->Claude bridge requires an id on tool_result; pass the
+      // OpenAI tool_call_id through so the functionCall/functionResponse pair links.
       contents.push({
         role: 'user',
         parts: [{
           functionResponse: {
             name: message.name || message.tool_call_id || 'tool',
+            ...(message.tool_call_id ? { id: message.tool_call_id } : {}),
             response: { result: typeof message.content === 'string' ? message.content : JSON.stringify(message.content) },
           },
         }],

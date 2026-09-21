@@ -217,6 +217,9 @@ export class UpstreamClient {
       const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined });
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
+      if (process.env.ANTIGRAVITY_DEBUG_BODY) {
+        console.error('[debug-body] failing request payload:', payload.slice(0, 200000));
+      }
       throw this.#upstreamErrorFrom(response.status, text, account.id);
     } catch (error) {
       if (error instanceof UpstreamError) throw error;
