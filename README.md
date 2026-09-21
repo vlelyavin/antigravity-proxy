@@ -82,7 +82,7 @@ hermes / any openai sdk: `base_url=http://127.0.0.1:8317/v1`, `api_key=none`, mo
 
 ## models
 
-`gemini-3.8-flash-{low,medium,high}`, `gemini-3.7/3.6-flash-*`, `gemini-3-flash`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. the list lives in `src/rewrite/openai-translate.js` — extend it when google ships more.
+`gemini-3.8-flash-{low,medium,high}`, `gemini-3.7/3.6-flash-*`, `gemini-3-flash`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. the list lives in `src/rewrite/models.js` — extend it when google ships more.
 
 ## multi-account
 
@@ -105,7 +105,7 @@ src/
   rewrite/        openai <-> cloud-code transforms + model catalog
   upstream/       cloud-code client with retry, account pool with cooldown
   server/         http surface: /health, /v1/models, /v1/chat/completions
-test/             22 tests, no network needed
+test/             34 tests, no network needed
 ```
 
 ## security

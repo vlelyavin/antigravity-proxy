@@ -27,6 +27,9 @@ RestartSec=3
 # no proxy env — the relay talks to google directly; per-account egress belongs upstream
 Environment=NO_PROXY=*
 Environment=ANTIGRAVITY_PROXY_LOG_LEVEL=info
+# port + egress override example:
+# Environment=ANTIGRAVITY_PROXY_PORT=8317
+# Environment=ANTIGRAVITY_PROXY_EGRESS_URL=socks5://127.0.0.1:1055
 
 [Install]
 WantedBy=default.target
