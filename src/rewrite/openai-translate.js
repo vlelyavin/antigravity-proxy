@@ -86,7 +86,7 @@ function partsFromContent(content) {
 
 const EFFORT_BUDGET = { low: 1000, medium: 4000, high: -1 };
 
-export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort }, { projectId, sessionId }) {
+export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort, response_format }, { projectId, sessionId }) {
   const catalogEntry = findModel(model);
   const budget = Number.isFinite(max_tokens) ? max_tokens : max_completion_tokens;
   const contents = [];
@@ -158,6 +158,21 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
   if (Number.isFinite(temperature)) generationConfig.temperature = temperature;
   if (Number.isFinite(top_p)) generationConfig.topP = top_p;
   if (stop) generationConfig.stopSequences = Array.isArray(stop) ? stop : [stop];
+  // OpenAI structured outputs -> Gemini generateConfig. Previously dropped silently:
+  // every strict-schema caller (session ledger, memory integrator, collectors) ran
+  // unconstrained through this relay and malformed JSON surfaced downstream as
+  // parse failures. json_schema -> responseMimeType + responseSchema; json_object
+  // -> responseMimeType only. Schema types go through the same normalizer as tool
+  // parameters (type unions -> scalar, anyOf -> oneOf).
+  if (response_format && typeof response_format === 'object') {
+    const fmt = response_format.type;
+    if (fmt === 'json_schema' && response_format.json_schema?.schema && typeof response_format.json_schema.schema === 'object') {
+      generationConfig.responseMimeType = 'application/json';
+      generationConfig.responseSchema = normalizeSchemaTypes(response_format.json_schema.schema);
+    } else if (fmt === 'json_object' || fmt === 'json') {
+      generationConfig.responseMimeType = 'application/json';
+    }
+  }
 
   const request = {
     contents,
