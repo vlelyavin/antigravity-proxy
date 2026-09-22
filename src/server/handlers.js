@@ -29,9 +29,15 @@ export function errorResponse(res, status, message, type = 'invalid_request_erro
 
 /** Runs an OpenAI-shaped request through the pool with rotation on quota/auth. */
 export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal, respondNative = false }) {
-  const accounts = store.readAll();
-  const maxAttempts = Math.min(accounts.length, 3);
   let lastError = null;
+  let accounts = [];
+  try {
+    accounts = store.readAll();
+  } catch (error) {
+    // missing/corrupt credential files: the pool is empty — still fall back
+    lastError = error;
+  }
+  const maxAttempts = Math.min(accounts.length, 3);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const account = pool.pick(accounts);

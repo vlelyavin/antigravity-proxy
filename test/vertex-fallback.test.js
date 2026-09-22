@@ -78,7 +78,7 @@ async function startStack({ accounts, vertexOpts = {}, fallbackEnabled = true } 
   const pool = new AccountPool({ logger });
   const server = createServer({ config, credentialStore: store, upstream: upstreamClient, pool, logger });
   await once(server.listen(0), 'listening');
-  return { server, upstreamServer, vertex, port: server.address().port, pool };
+  return { server, upstreamServer, vertex, port: server.address().port, pool, store };
 }
 
 async function post(port, body) {
@@ -190,6 +190,21 @@ test('all accounts cooling down -> fallback used', async () => {
     assert.equal(res.status, 200);
     const json = await res.json();
     assert.equal(json.choices[0].message.content, 'vertex-ok');
+  } finally {
+    stack.server.close(); stack.upstreamServer.close(); stack.vertex.server.close();
+  }
+});
+
+test('empty credential store (readAll throws) -> fallback used', async () => {
+  const stack = await startStack({ accounts: [] });
+  // simulate missing credential files: readAll throws instead of returning []
+  stack.store.readAll = () => { throw new Error('no antigravity token files found'); };
+  try {
+    const res = await post(stack.port, { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.choices[0].message.content, 'vertex-ok');
+    assert.equal(stack.vertex.calls.length, 1);
   } finally {
     stack.server.close(); stack.upstreamServer.close(); stack.vertex.server.close();
   }
