@@ -58,7 +58,7 @@ async function startStack({ accounts, apiKey = null, upstreamOpts = {} } = {}) {
 
   const config = {
     ...CONFIG,
-    upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', eagerRefreshMs: 0 },
+    upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', eagerRefreshMs: 0, egress: { url: null } },
     apiKey,
   };
   const upstreamClient = new UpstreamClient({ config, logger });
@@ -132,7 +132,7 @@ test('client disconnect aborts upstream stream (C4, quota burn guard)', async ()
   const logger = createLogger('error');
   const store = new CredentialStore({ searchPaths: [], logger });
   store.readAll = () => [{ id: 'a1', projectId: 'p' }];
-  const config = { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal' } };
+  const config = { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', egress: { url: null } } };
   const upstreamClient = new UpstreamClient({ config, logger });
   upstreamClient.accessToken = async () => 'test-token';
   const pool = new AccountPool({ logger });
@@ -167,7 +167,7 @@ test('mid-stream failure emits error frame + [DONE] (H4)', async () => {
   const logger = createLogger('error');
   const store = new CredentialStore({ searchPaths: [], logger });
   store.readAll = () => [{ id: 'a2', projectId: 'p' }];
-  const config = { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal' } };
+  const config = { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', egress: { url: null } } };
   const upstreamClient = new UpstreamClient({ config, logger });
   upstreamClient.accessToken = async () => 'test-token';
   const pool = new AccountPool({ logger });

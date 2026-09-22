@@ -27,6 +27,15 @@ export const DEFAULTS = {
 
   apiKey: null, // set to require "Authorization: Bearer <key>" or "x-api-key: <key>" from clients
 
+  // Last-resort relay when the whole antigravity account pool is exhausted
+  // (all accounts 429/cooling/failing). Only fires for gemini-family models —
+  // the target is a Vertex OpenAI-compatible endpoint, non-gemini ids would 400.
+  fallback: {
+    vertexUrl: 'http://127.0.0.1:18804/v1/chat/completions',
+    enabled: true,
+    timeoutMs: 120_000,
+  },
+
   rotation: {
     // after a 429 RESOURCE_EXHAUSTED the account cools down for this long (ms)
     cooldownMs: 60_000,

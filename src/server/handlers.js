@@ -1,6 +1,7 @@
 import { antigravityToOpenAi, antigravityChunkToOpenAiChunk } from '../rewrite/openai-translate.js';
 import { modelsPayload } from '../rewrite/models.js';
 import { UpstreamError } from '../upstream/upstream-client.js';
+import { generateViaVertexFallback, isGeminiFamily, openAiJsonToStreamFrames } from '../upstream/vertex-fallback.js';
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
@@ -36,7 +37,8 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
     const account = pool.pick(accounts);
     if (!account) {
       // all accounts cooling down: fail fast, do not hammer the exhausted pool
-      throw new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
+      lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
+      break;
     }
     try {
       if (openAiBody.stream) {
@@ -59,10 +61,42 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
           continue;
         }
       }
-      throw error;
+      break;
     }
   }
+  // Pool exhausted: last-resort Vertex relay before giving up.
+  if (await tryVertexFallback({ config, logger, openAiBody, res, signal, respondNative, lastError })) return;
   throw lastError ?? new UpstreamError('no accounts available', { status: 502 });
+}
+
+/** Last-resort relay to the local Vertex proxy when every antigravity account failed. */
+async function tryVertexFallback({ config, logger, openAiBody, res, signal, respondNative, lastError }) {
+  const fb = config.fallback;
+  if (!fb?.enabled || !fb.vertexUrl || respondNative || res.headersSent) return false;
+  if (!isGeminiFamily(openAiBody.model)) return false;
+  logger.warn('vertex_fallback.attempt', { model: openAiBody.model, poolError: lastError?.message });
+  try {
+    const json = await generateViaVertexFallback({
+      openAiBody, vertexUrl: fb.vertexUrl, timeoutMs: fb.timeoutMs, signal,
+    });
+    if (openAiBody.stream) {
+      const body = openAiJsonToStreamFrames(json, openAiBody.model);
+      res.writeHead(200, {
+        'content-type': 'text/event-stream', 'cache-control': 'no-cache',
+        connection: 'keep-alive', 'content-length': Buffer.byteLength(body),
+      });
+      res.end(body);
+    } else {
+      const body = JSON.stringify(json);
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+      res.end(body);
+    }
+    logger.warn('vertex_fallback.ok', { model: openAiBody.model });
+    return true;
+  } catch (error) {
+    logger.warn('vertex_fallback.failed', { model: openAiBody.model, error: error.message });
+    return false;
+  }
 }
 
 async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false }) {

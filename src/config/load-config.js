@@ -48,6 +48,8 @@ export function loadConfig({ configPath = null, env = process.env } = {}) {
   if (env.ANTIGRAVITY_PROXY_API_KEY) config.apiKey = env.ANTIGRAVITY_PROXY_API_KEY;
   if (env.ANTIGRAVITY_PROXY_LOG_LEVEL) config.logLevel = env.ANTIGRAVITY_PROXY_LOG_LEVEL;
   if (env.ANTIGRAVITY_PROXY_UPSTREAM) config.upstream.baseUrl = env.ANTIGRAVITY_PROXY_UPSTREAM;
+  if (env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK === 'off' || env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK === 'none') config.fallback.enabled = false;
+  else if (env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK) config.fallback.vertexUrl = env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK;
 
   if (!Number.isInteger(config.listen.port) || config.listen.port < 0 || config.listen.port > 65535) {
     throw new Error(`invalid listen.port: ${config.listen.port}`);

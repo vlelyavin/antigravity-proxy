@@ -48,7 +48,7 @@ async function startStack({ accounts, apiKey = null } = {}) {
 
   const config = {
     ...CONFIG,
-    upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', eagerRefreshMs: 0 },
+    upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', eagerRefreshMs: 0, egress: { url: null } },
     apiKey,
   };
   // stub refresh: access token comes back as 'test-token'
