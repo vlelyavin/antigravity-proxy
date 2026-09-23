@@ -14,26 +14,58 @@ export const THOUGHT_SIGNATURE_BYPASS = 'skip_thought_signature_validator';
 // ("Proto field is not repeating, cannot start list"). Collapse unions to the
 // first non-null type — the enum-null wire constraint from the CPA era
 // (mari sessions report antigravity-verify-2026-09-21).
-function normalizeSchemaTypes(node) {
-  if (Array.isArray(node)) return node.map(normalizeSchemaTypes);
+// keepNull: the response_format path. There the upstream ENFORCES the schema, so a
+// bare collapse turns every nullable field into a required non-null one (the model
+// then invents ids/dates to fill them); the null survives as `nullable: true`.
+// Tool declarations keep the plain collapse — they are not enforced upstream.
+function normalizeSchemaTypes(node, keepNull = false) {
+  if (Array.isArray(node)) return node.map((item) => normalizeSchemaTypes(item, keepNull));
   if (!node || typeof node !== 'object') return node;
   const out = {};
   for (const [key, value] of Object.entries(node)) {
     if (key === 'type' && Array.isArray(value)) {
       const scalar = value.find((t) => t !== 'null') ?? value[0];
       out.type = scalar;
+      if (keepNull && value.includes('null')) out.nullable = true;
       continue;
     }
     if (key === 'anyOf' && Array.isArray(value)) {
       // Claude-side validation bridge (Vertex) rejects anyOf outright even though
       // draft 2020-12 allows it; oneOf passes. Union semantics for tool input
       // validation are interchangeable here, so rewrite anyOf → oneOf.
-      out.oneOf = normalizeSchemaTypes(value);
+      out.oneOf = normalizeSchemaTypes(value, keepNull);
       continue;
     }
-    out[key] = normalizeSchemaTypes(value);
+    out[key] = normalizeSchemaTypes(value, keepNull);
   }
   return out;
+}
+
+// The upstream responseSchema is an OpenAPI subset without $ref/$defs (400 "Unknown
+// name $ref"), so local refs are inlined. An unresolvable or self-recursive ref
+// throws: failing the request beats sending the upstream a schema it rejects anyway.
+function inlineSchemaRefs(root) {
+  const reject = (message) => Object.assign(new Error(`response_format: ${message}`), { status: 400 });
+  const walk = (node, depth) => {
+    if (Array.isArray(node)) return node.map((item) => walk(item, depth));
+    if (!node || typeof node !== 'object') return node;
+    if (typeof node.$ref === 'string') {
+      const [, container, name] = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(node.$ref) ?? [];
+      const defs = container ? root[container] : undefined;
+      if (!defs || !Object.hasOwn(defs, name)) throw reject(`unresolvable $ref ${node.$ref}`);
+      if (depth >= 32) throw reject(`$ref nesting too deep at ${node.$ref}`);
+      // 2020-12 applies keywords next to $ref too (description, nullable unions…)
+      const { $ref, ...siblings } = node;
+      return walk({ ...defs[name], ...siblings }, depth + 1);
+    }
+    const out = {};
+    for (const [key, value] of Object.entries(node)) out[key] = walk(value, depth);
+    return out;
+  };
+  // The definition containers are root keywords; deeper down a key named
+  // "definitions" is most likely a property name (data), so only the root pair goes.
+  const { $defs, definitions, ...schema } = root;
+  return walk(schema, 0);
 }
 
 const STOP_MAP = {
@@ -162,13 +194,13 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
   // every strict-schema caller (session ledger, memory integrator, collectors) ran
   // unconstrained through this relay and malformed JSON surfaced downstream as
   // parse failures. json_schema -> responseMimeType + responseSchema; json_object
-  // -> responseMimeType only. Schema types go through the same normalizer as tool
-  // parameters (type unions -> scalar, anyOf -> oneOf).
+  // -> responseMimeType only. Local $refs are inlined and type unions keep their
+  // null as `nullable` (the upstream enforces this schema; see normalizeSchemaTypes).
   if (response_format && typeof response_format === 'object') {
     const fmt = response_format.type;
     if (fmt === 'json_schema' && response_format.json_schema?.schema && typeof response_format.json_schema.schema === 'object') {
       generationConfig.responseMimeType = 'application/json';
-      generationConfig.responseSchema = normalizeSchemaTypes(response_format.json_schema.schema);
+      generationConfig.responseSchema = normalizeSchemaTypes(inlineSchemaRefs(response_format.json_schema.schema), true);
     } else if (fmt === 'json_object' || fmt === 'json') {
       generationConfig.responseMimeType = 'application/json';
     }

@@ -31,3 +31,92 @@ test('OpenAI type-union schemas normalize to scalar types for google proto', () 
   assert.equal(props.nested.properties.deep.type, 'integer');
   assert.equal(props.keep.type, 'string');
 });
+
+const translate = (extra) => openAiToAntigravity({
+  model: 'gemini-3.8-flash-high',
+  messages: [{ role: 'user', content: 'x' }],
+  ...extra,
+}, { projectId: 'p', sessionId: 's' });
+
+const jsonSchema = (schema) => ({ response_format: { type: 'json_schema', json_schema: { name: 'n', strict: true, schema } } });
+
+test('response_format keeps null unions as nullable — the upstream enforces this schema', () => {
+  const gc = translate(jsonSchema({
+    type: 'object',
+    additionalProperties: false,
+    required: ['entryId', 'actor', 'summary', 'importance'],
+    properties: {
+      entryId: { type: ['string', 'null'] },
+      actor: { type: ['string', 'null'], enum: ['user', 'mari', 'both'] },
+      summary: { type: 'string' },
+      importance: { type: 'number' },
+      ids: { type: ['array', 'null'], items: { type: 'string' } },
+    },
+  })).request.generationConfig;
+
+  assert.equal(gc.responseMimeType, 'application/json');
+  const props = gc.responseSchema.properties;
+  assert.deepEqual(props.entryId, { type: 'string', nullable: true });
+  assert.deepEqual(props.actor, { type: 'string', nullable: true, enum: ['user', 'mari', 'both'] });
+  assert.deepEqual(props.ids, { type: 'array', nullable: true, items: { type: 'string' } });
+  assert.equal(props.summary.nullable, undefined);
+  assert.equal(props.importance.nullable, undefined);
+});
+
+test('response_format inlines local $refs — the upstream rejects $ref/$defs outright', () => {
+  const gc = translate(jsonSchema({
+    type: 'object',
+    properties: {
+      operations: { type: 'array', items: { $ref: '#/$defs/operation' } },
+      legacy: { $ref: '#/definitions/old', description: 'kept' },
+      dictionary: { type: 'object', properties: { definitions: { type: 'array', items: { type: 'string' } } } },
+    },
+    $defs: {
+      transition: { type: 'object', properties: { kind: { type: 'string', enum: ['NEW', 'RETRACTS'] } } },
+      operation: { type: 'object', properties: { cardKey: { type: ['string', 'null'] }, transition: { $ref: '#/$defs/transition' } } },
+    },
+    definitions: { old: { type: 'integer' } },
+  })).request.generationConfig;
+
+  const wire = JSON.stringify(gc.responseSchema);
+  assert.ok(!wire.includes('$ref') && !wire.includes('$defs'), wire);
+  assert.equal(gc.responseSchema.definitions, undefined);
+  // a PROPERTY named "definitions" is data, not a container — it must survive
+  assert.deepEqual(gc.responseSchema.properties.dictionary.properties.definitions, { type: 'array', items: { type: 'string' } });
+  const op = gc.responseSchema.properties.operations.items;
+  assert.deepEqual(op.properties.cardKey, { type: 'string', nullable: true });
+  assert.deepEqual(op.properties.transition.properties.kind.enum, ['NEW', 'RETRACTS']);
+  assert.deepEqual(gc.responseSchema.properties.legacy, { type: 'integer', description: 'kept' });
+});
+
+test('response_format translation never mutates the caller body — the vertex fallback forwards it verbatim', () => {
+  const body = jsonSchema({
+    type: 'object',
+    properties: { a: { $ref: '#/$defs/a' }, b: { type: ['string', 'null'] } },
+    $defs: { a: { type: ['integer', 'null'] } },
+  });
+  const before = structuredClone(body);
+  translate(body);
+  assert.deepEqual(body, before);
+});
+
+test('response_format rejects unresolvable and self-recursive $refs with a 400', () => {
+  for (const schema of [
+    { type: 'object', properties: { a: { $ref: '#/$defs/missing' } } },
+    { type: 'object', properties: { a: { $ref: 'https://example.com/schema.json' } } },
+    { $defs: { node: { type: 'object', properties: { next: { $ref: '#/$defs/node' } } } }, $ref: '#/$defs/node' },
+  ]) {
+    assert.throws(() => translate(jsonSchema(schema)), (error) => error.status === 400 && /response_format/.test(error.message));
+  }
+});
+
+test('json_object sets only the mime type; tool declarations keep the plain collapse', () => {
+  const gc = translate({ response_format: { type: 'json_object' } }).request.generationConfig;
+  assert.equal(gc.responseMimeType, 'application/json');
+  assert.equal(gc.responseSchema, undefined);
+
+  const decl = translate({
+    tools: [{ type: 'function', function: { name: 't', parameters: { type: 'object', properties: { e: { type: ['string', 'null'] } } } } }],
+  }).request.tools[0].functionDeclarations[0];
+  assert.deepEqual(decl.parameters.properties.e, { type: 'string' });
+});
