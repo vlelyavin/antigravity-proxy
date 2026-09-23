@@ -1,6 +1,6 @@
 import { newSessionId } from '../credentials/oauth.js';
 import { openAiToAntigravity } from '../rewrite/openai-translate.js';
-import { makeEgressAgent } from './egress.js';
+import { dropIdleSockets, makeEgressAgent } from './egress.js';
 
 export class UpstreamError extends Error {
   constructor(message, { status = 502, retryable = false, accountId = null } = {}) {
@@ -229,7 +229,9 @@ export class UpstreamClient {
       }
       preflightFailure = error;
     }
-    // single pre-flight retry
+    // single pre-flight retry, on a fresh connection: the failed attempt most likely took a dead
+    // pooled socket, and the pool can hold more of them (23.09 03:43: the retry hit one too)
+    for (const agent of this.agents.values()) dropIdleSockets(agent);
     try {
       const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined });
       if (response.ok) return response;

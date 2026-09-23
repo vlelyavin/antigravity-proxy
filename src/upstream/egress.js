@@ -222,9 +222,16 @@ export async function egressTlsConnection({ egressUrl, host, port = 443, servern
   });
 }
 
+// A pooled connection that sits idle dies silently on the egress path (no FIN reaches us), and
+// the next request on it fails with "socket hang up". 2026-09-23 03:43: the attempt and its retry
+// both took dead sockets after 29 min idle, the call fell back to Vertex and the turn took 33 s.
+// Node's agent `timeout` closes a free socket after this idle time; in-flight sockets are left
+// alone. A fresh dial costs well under a second, a dead socket costs the whole request.
+export const IDLE_SOCKET_TIMEOUT_MS = 60_000;
+
 /** https.Agent (or http.Agent for plaintext) routing all connections through egress. */
-export function makeEgressAgent({ egressUrl, protocol = 'https:' }) {
-  const opts = { keepAlive: true, maxSockets: 8 };
+export function makeEgressAgent({ egressUrl, protocol = 'https:', idleSocketTimeoutMs = IDLE_SOCKET_TIMEOUT_MS }) {
+  const opts = { keepAlive: true, maxSockets: 8, timeout: idleSocketTimeoutMs };
   if (!egressUrl) {
     return protocol === 'https:' ? new https.Agent(opts) : new http.Agent(opts);
   }
@@ -244,4 +251,11 @@ export function makeEgressAgent({ egressUrl, protocol = 'https:' }) {
     }
   }
   return new EgressAgent(opts);
+}
+
+/** Close the agent's idle pooled sockets; sockets serving a request are untouched. */
+export function dropIdleSockets(agent) {
+  for (const sockets of Object.values(agent?.freeSockets ?? {})) {
+    for (const socket of sockets) socket.destroy();
+  }
 }
