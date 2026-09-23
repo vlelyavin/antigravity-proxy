@@ -44,14 +44,16 @@ function normalizeSchemaTypes(node, keepNull = false) {
 // The upstream responseSchema is an OpenAPI subset without $ref/$defs (400 "Unknown
 // name $ref"), so local refs are inlined. An unresolvable or recursive ref throws:
 // failing the request beats sending the upstream a schema it rejects anyway.
-// Inlining a DAG that references a def twice per level grows 2^depth, so the total
-// number of resolutions is budgeted — one hostile schema must not OOM the process.
-const MAX_REF_RESOLUTIONS = 1000;
+// Inlining multiplies: a DAG referencing a def twice per level grows 2^depth, and a
+// fat def referenced many times grows size × refs. The walk is budgeted by every
+// value it produces, so one hostile schema can neither OOM nor stall the event loop.
+const MAX_INLINED_VALUES = 100_000;
 
 function inlineSchemaRefs(root) {
   const reject = (message) => Object.assign(new Error(`response_format: ${message}`), { status: 400 });
-  let budget = MAX_REF_RESOLUTIONS;
+  let budget = MAX_INLINED_VALUES;
   const walk = (node, refPath) => {
+    if (--budget < 0) throw reject(`schema exceeds ${MAX_INLINED_VALUES} values after $ref inlining`);
     if (Array.isArray(node)) return node.map((item) => walk(item, refPath));
     if (!node || typeof node !== 'object') return node;
     if (typeof node.$ref === 'string') {
@@ -60,7 +62,6 @@ function inlineSchemaRefs(root) {
       if (!defs || !Object.hasOwn(defs, name)) throw reject(`unresolvable $ref ${node.$ref}`);
       // recursion = the same def already open on this path; a long linear chain is fine
       if (refPath.includes(node.$ref)) throw reject(`recursive $ref ${node.$ref}`);
-      if (--budget < 0) throw reject(`$ref expansion exceeds ${MAX_REF_RESOLUTIONS} resolutions`);
       // 2020-12 applies keywords next to $ref too (description, nullable unions…)
       const { $ref, ...siblings } = node;
       return walk({ ...defs[name], ...siblings }, [...refPath, $ref]);

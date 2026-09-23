@@ -154,3 +154,18 @@ test('response_format: an indirect cycle between two defs is a 400', () => {
   };
   assert.throws(() => translate(jsonSchema(schema)), (error) => error.status === 400 && /recursive/.test(error.message));
 });
+
+// review pass 4 (2026-09-23): a fat def referenced many times stays inside a resolution budget but
+// multiplies the OUTPUT (30k props × 1000 refs OOM'd, 5k × 1000 froze the event loop 7 s).
+test('response_format: a fat def referenced many times is rejected fast, not inlined into gigabytes', () => {
+  const properties = {};
+  for (let i = 0; i < 5000; i++) properties[`f${i}`] = { type: 'string' };
+  const items = {};
+  for (let r = 0; r < 1000; r++) items[`r${r}`] = { $ref: '#/$defs/fat' };
+  const started = Date.now();
+  assert.throws(
+    () => translate(jsonSchema({ type: 'object', properties: items, $defs: { fat: { type: 'object', properties } } })),
+    (error) => error.status === 400 && /exceeds/.test(error.message),
+  );
+  assert.ok(Date.now() - started < 2000, 'the value budget must stop the copy early');
+});
