@@ -120,3 +120,37 @@ test('json_object sets only the mime type; tool declarations keep the plain coll
   }).request.tools[0].functionDeclarations[0];
   assert.deepEqual(decl.parameters.properties.e, { type: 'string' });
 });
+
+// review P1/P2 (2026-09-23): a def referencing the next one twice grows 2^depth — must be a fast 400,
+// never an OOM; a long linear chain without a cycle is legal and must inline.
+const chain = (levels, refsPerLevel) => {
+  const $defs = {};
+  for (let i = 0; i < levels; i++) {
+    const properties = {};
+    for (let r = 0; r < refsPerLevel; r++) properties[`p${r}`] = { $ref: `#/$defs/d${i + 1}` };
+    $defs[`d${i}`] = { type: 'object', properties };
+  }
+  $defs[`d${levels}`] = { type: 'string' };
+  return { $ref: '#/$defs/d0', $defs };
+};
+
+test('response_format: exponential $ref DAG is rejected fast instead of exhausting memory', () => {
+  const started = Date.now();
+  assert.throws(() => translate(jsonSchema(chain(40, 2))), (error) => error.status === 400 && /exceeds/.test(error.message));
+  assert.ok(Date.now() - started < 2000, 'budget must stop the expansion early');
+});
+
+test('response_format: a 40-deep linear $ref chain is legal and inlines', () => {
+  let node = translate(jsonSchema(chain(40, 1))).request.generationConfig.responseSchema;
+  for (let i = 0; i < 40; i++) node = node.properties.p0;
+  assert.deepEqual(node, { type: 'string' });
+});
+
+test('response_format: an indirect cycle between two defs is a 400', () => {
+  const schema = {
+    type: 'object',
+    properties: { a: { $ref: '#/$defs/x' } },
+    $defs: { x: { type: 'object', properties: { y: { $ref: '#/$defs/y' } } }, y: { type: 'object', properties: { x: { $ref: '#/$defs/x' } } } },
+  };
+  assert.throws(() => translate(jsonSchema(schema)), (error) => error.status === 400 && /recursive/.test(error.message));
+});

@@ -42,30 +42,37 @@ function normalizeSchemaTypes(node, keepNull = false) {
 }
 
 // The upstream responseSchema is an OpenAPI subset without $ref/$defs (400 "Unknown
-// name $ref"), so local refs are inlined. An unresolvable or self-recursive ref
-// throws: failing the request beats sending the upstream a schema it rejects anyway.
+// name $ref"), so local refs are inlined. An unresolvable or recursive ref throws:
+// failing the request beats sending the upstream a schema it rejects anyway.
+// Inlining a DAG that references a def twice per level grows 2^depth, so the total
+// number of resolutions is budgeted — one hostile schema must not OOM the process.
+const MAX_REF_RESOLUTIONS = 1000;
+
 function inlineSchemaRefs(root) {
   const reject = (message) => Object.assign(new Error(`response_format: ${message}`), { status: 400 });
-  const walk = (node, depth) => {
-    if (Array.isArray(node)) return node.map((item) => walk(item, depth));
+  let budget = MAX_REF_RESOLUTIONS;
+  const walk = (node, refPath) => {
+    if (Array.isArray(node)) return node.map((item) => walk(item, refPath));
     if (!node || typeof node !== 'object') return node;
     if (typeof node.$ref === 'string') {
       const [, container, name] = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(node.$ref) ?? [];
       const defs = container ? root[container] : undefined;
       if (!defs || !Object.hasOwn(defs, name)) throw reject(`unresolvable $ref ${node.$ref}`);
-      if (depth >= 32) throw reject(`$ref nesting too deep at ${node.$ref}`);
+      // recursion = the same def already open on this path; a long linear chain is fine
+      if (refPath.includes(node.$ref)) throw reject(`recursive $ref ${node.$ref}`);
+      if (--budget < 0) throw reject(`$ref expansion exceeds ${MAX_REF_RESOLUTIONS} resolutions`);
       // 2020-12 applies keywords next to $ref too (description, nullable unions…)
       const { $ref, ...siblings } = node;
-      return walk({ ...defs[name], ...siblings }, depth + 1);
+      return walk({ ...defs[name], ...siblings }, [...refPath, $ref]);
     }
     const out = {};
-    for (const [key, value] of Object.entries(node)) out[key] = walk(value, depth);
+    for (const [key, value] of Object.entries(node)) out[key] = walk(value, refPath);
     return out;
   };
   // The definition containers are root keywords; deeper down a key named
   // "definitions" is most likely a property name (data), so only the root pair goes.
   const { $defs, definitions, ...schema } = root;
-  return walk(schema, 0);
+  return walk(schema, []);
 }
 
 const STOP_MAP = {
