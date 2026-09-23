@@ -189,9 +189,31 @@ test('response_format: absurd nesting is a 400, never a RangeError surfacing as 
   assert.throws(() => translate(jsonSchema({ type: 'object', properties: { a: node } })), (error) => error.status === 400 && /deep/.test(error.message));
 });
 
-test('response_format: a large legitimate flat schema (60k properties, no refs) still passes', () => {
+test('response_format: a large legitimate flat schema (20k properties, no refs) still passes', () => {
   const properties = {};
-  for (let i = 0; i < 60_000; i++) properties[`f${i}`] = { type: 'string' };
+  for (let i = 0; i < 20_000; i++) properties[`f${i}`] = { type: 'string' };
   const schema = translate(jsonSchema({ type: 'object', properties })).request.generationConfig.responseSchema;
-  assert.equal(Object.keys(schema.properties).length, 60_000);
+  assert.equal(Object.keys(schema.properties).length, 20_000);
+});
+
+// review pass 6 (2026-09-23): the recursion check was O(path) per $ref and unbudgeted — a deep chain of
+// long-named defs ending in a wide fan-out stalled the loop for seconds to a minute. Any shape of that
+// family must now finish (either way) well under a second.
+test('response_format: deep long-named ref chain with a wide fan-out stays cheap', () => {
+  const $defs = {};
+  const name = (i) => `${'n'.repeat(100)}${i}`;
+  for (let i = 0; i < 80; i++) $defs[name(i)] = { type: 'object', properties: { next: { $ref: `#/$defs/${name(i + 1)}` } } };
+  const fan = {};
+  for (let r = 0; r < 2000; r++) fan[`r${r}`] = { $ref: '#/$defs/leaf' };
+  $defs[name(80)] = { type: 'object', properties: fan };
+  $defs.leaf = { type: 'string' };
+  const started = Date.now();
+  try { translate(jsonSchema({ $ref: `#/$defs/${name(0)}`, $defs })); } catch (error) { assert.equal(error.status, 400); }
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+});
+
+test('response_format: nesting just past the V8 stringify limit is a 400 from the depth cap', () => {
+  let node = { type: 'string' };
+  for (let i = 0; i < 1850; i++) node = { type: 'object', properties: { n: node } };
+  assert.throws(() => translate(jsonSchema({ type: 'object', properties: { a: node } })), (error) => error.status === 400 && /deep/.test(error.message));
 });

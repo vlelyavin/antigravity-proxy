@@ -45,10 +45,13 @@ function normalizeSchemaTypes(node, keepNull = false) {
 // name $ref"), so local refs are inlined. An unresolvable or recursive ref throws:
 // failing the request beats sending the upstream a schema it rejects anyway.
 // Inlining multiplies — a DAG referencing a def twice per level grows 2^depth, a fat
-// def (or a long description) referenced many times grows size × refs — so the walk
-// spends a budget of roughly the serialized output size (key and string lengths, one
-// unit per other value). One hostile schema can neither OOM nor stall the event loop.
-const MAX_INLINED_CHARS = 4_000_000;
+// def (or a long description) referenced many times grows size × refs — so every step
+// of the walk spends a budget of roughly the serialized output size (key, string and
+// ref-name lengths, one unit per other value) and nesting is capped. Every step is O(1)
+// beyond what it pays for, so one hostile schema can neither OOM the process nor stall
+// the event loop for more than a fraction of a second, and no walker can hit the stack.
+const MAX_INLINED_CHARS = 1_000_000;
+const MAX_SCHEMA_DEPTH = 256;
 
 const schemaRejection = (message) => Object.assign(new Error(`response_format: ${message}`), { status: 400 });
 
@@ -58,46 +61,43 @@ function inlineSchemaRefs(root) {
     budget -= cost;
     if (budget < 0) throw schemaRejection(`schema exceeds ~${MAX_INLINED_CHARS} chars after $ref inlining`);
   };
-  const walk = (node, refPath) => {
+  const open = new Set(); // refs being expanded on the current path; meeting one again is recursion
+  const walk = (node, depth) => {
+    if (depth > MAX_SCHEMA_DEPTH) throw schemaRejection('schema nesting too deep');
     if (typeof node === 'string') {
       spend(node.length + 2);
       return node;
     }
     spend(1);
-    if (Array.isArray(node)) return node.map((item) => walk(item, refPath));
+    if (Array.isArray(node)) return node.map((item) => walk(item, depth + 1));
     if (!node || typeof node !== 'object') return node;
     if (typeof node.$ref === 'string') {
-      const [, container, name] = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(node.$ref) ?? [];
+      const ref = node.$ref;
+      spend(ref.length);
+      const [, container, name] = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(ref) ?? [];
       const defs = container ? root[container] : undefined;
-      if (!defs || !Object.hasOwn(defs, name)) throw schemaRejection(`unresolvable $ref ${node.$ref}`);
-      // recursion = the same def already open on this path; a long linear chain is fine
-      if (refPath.includes(node.$ref)) throw schemaRejection(`recursive $ref ${node.$ref}`);
+      if (!defs || !Object.hasOwn(defs, name)) throw schemaRejection(`unresolvable $ref ${ref}`);
+      if (open.has(ref)) throw schemaRejection(`recursive $ref ${ref}`);
       // 2020-12 applies keywords next to $ref too (description, nullable unions…)
       const { $ref, ...siblings } = node;
-      return walk({ ...defs[name], ...siblings }, [...refPath, $ref]);
+      open.add(ref);
+      try {
+        return walk({ ...defs[name], ...siblings }, depth + 1);
+      } finally {
+        open.delete(ref);
+      }
     }
     const out = {};
     for (const [key, value] of Object.entries(node)) {
       spend(key.length + 3);
-      out[key] = walk(value, refPath);
+      out[key] = walk(value, depth + 1);
     }
     return out;
   };
   // The definition containers are root keywords; deeper down a key named
   // "definitions" is most likely a property name (data), so only the root pair goes.
   const { $defs, definitions, ...schema } = root;
-  return walk(schema, []);
-}
-
-// A pathologically deep schema overflows the JS stack in either walker; that is the
-// caller's bad input (400), not a server fault (the RangeError would surface as 502).
-function toResponseSchema(schema) {
-  try {
-    return normalizeSchemaTypes(inlineSchemaRefs(schema), true);
-  } catch (error) {
-    if (error instanceof RangeError) throw schemaRejection('schema nesting too deep');
-    throw error;
-  }
+  return walk(schema, 0);
 }
 
 const STOP_MAP = {
@@ -232,7 +232,7 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     const fmt = response_format.type;
     if (fmt === 'json_schema' && response_format.json_schema?.schema && typeof response_format.json_schema.schema === 'object') {
       generationConfig.responseMimeType = 'application/json';
-      generationConfig.responseSchema = toResponseSchema(response_format.json_schema.schema);
+      generationConfig.responseSchema = normalizeSchemaTypes(inlineSchemaRefs(response_format.json_schema.schema), true);
     } else if (fmt === 'json_object' || fmt === 'json') {
       generationConfig.responseMimeType = 'application/json';
     }
