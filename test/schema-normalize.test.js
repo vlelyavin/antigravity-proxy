@@ -169,3 +169,29 @@ test('response_format: a fat def referenced many times is rejected fast, not inl
   );
   assert.ok(Date.now() - started < 2000, 'the value budget must stop the copy early');
 });
+
+// review pass 5 (2026-09-23): a value count prices a 20k-char description at one unit; referenced many
+// times it froze the event loop in JSON.stringify and sent hundreds of MB upstream. The budget is output size.
+test('response_format: a long string inside a def referenced many times is rejected fast', () => {
+  const items = {};
+  for (let r = 0; r < 300; r++) items[`r${r}`] = { $ref: '#/$defs/bomb' };
+  const started = Date.now();
+  assert.throws(
+    () => translate(jsonSchema({ type: 'object', properties: items, $defs: { bomb: { type: 'string', description: 'x'.repeat(20_000) } } })),
+    (error) => error.status === 400 && /exceeds/.test(error.message),
+  );
+  assert.ok(Date.now() - started < 2000);
+});
+
+test('response_format: absurd nesting is a 400, never a RangeError surfacing as 502', () => {
+  let node = { type: 'string' };
+  for (let i = 0; i < 20_000; i++) node = { type: 'object', properties: { n: node } };
+  assert.throws(() => translate(jsonSchema({ type: 'object', properties: { a: node } })), (error) => error.status === 400 && /deep/.test(error.message));
+});
+
+test('response_format: a large legitimate flat schema (60k properties, no refs) still passes', () => {
+  const properties = {};
+  for (let i = 0; i < 60_000; i++) properties[`f${i}`] = { type: 'string' };
+  const schema = translate(jsonSchema({ type: 'object', properties })).request.generationConfig.responseSchema;
+  assert.equal(Object.keys(schema.properties).length, 60_000);
+});

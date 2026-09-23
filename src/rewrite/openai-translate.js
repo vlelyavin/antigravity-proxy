@@ -44,36 +44,60 @@ function normalizeSchemaTypes(node, keepNull = false) {
 // The upstream responseSchema is an OpenAPI subset without $ref/$defs (400 "Unknown
 // name $ref"), so local refs are inlined. An unresolvable or recursive ref throws:
 // failing the request beats sending the upstream a schema it rejects anyway.
-// Inlining multiplies: a DAG referencing a def twice per level grows 2^depth, and a
-// fat def referenced many times grows size × refs. The walk is budgeted by every
-// value it produces, so one hostile schema can neither OOM nor stall the event loop.
-const MAX_INLINED_VALUES = 100_000;
+// Inlining multiplies — a DAG referencing a def twice per level grows 2^depth, a fat
+// def (or a long description) referenced many times grows size × refs — so the walk
+// spends a budget of roughly the serialized output size (key and string lengths, one
+// unit per other value). One hostile schema can neither OOM nor stall the event loop.
+const MAX_INLINED_CHARS = 4_000_000;
+
+const schemaRejection = (message) => Object.assign(new Error(`response_format: ${message}`), { status: 400 });
 
 function inlineSchemaRefs(root) {
-  const reject = (message) => Object.assign(new Error(`response_format: ${message}`), { status: 400 });
-  let budget = MAX_INLINED_VALUES;
+  let budget = MAX_INLINED_CHARS;
+  const spend = (cost) => {
+    budget -= cost;
+    if (budget < 0) throw schemaRejection(`schema exceeds ~${MAX_INLINED_CHARS} chars after $ref inlining`);
+  };
   const walk = (node, refPath) => {
-    if (--budget < 0) throw reject(`schema exceeds ${MAX_INLINED_VALUES} values after $ref inlining`);
+    if (typeof node === 'string') {
+      spend(node.length + 2);
+      return node;
+    }
+    spend(1);
     if (Array.isArray(node)) return node.map((item) => walk(item, refPath));
     if (!node || typeof node !== 'object') return node;
     if (typeof node.$ref === 'string') {
       const [, container, name] = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(node.$ref) ?? [];
       const defs = container ? root[container] : undefined;
-      if (!defs || !Object.hasOwn(defs, name)) throw reject(`unresolvable $ref ${node.$ref}`);
+      if (!defs || !Object.hasOwn(defs, name)) throw schemaRejection(`unresolvable $ref ${node.$ref}`);
       // recursion = the same def already open on this path; a long linear chain is fine
-      if (refPath.includes(node.$ref)) throw reject(`recursive $ref ${node.$ref}`);
+      if (refPath.includes(node.$ref)) throw schemaRejection(`recursive $ref ${node.$ref}`);
       // 2020-12 applies keywords next to $ref too (description, nullable unions…)
       const { $ref, ...siblings } = node;
       return walk({ ...defs[name], ...siblings }, [...refPath, $ref]);
     }
     const out = {};
-    for (const [key, value] of Object.entries(node)) out[key] = walk(value, refPath);
+    for (const [key, value] of Object.entries(node)) {
+      spend(key.length + 3);
+      out[key] = walk(value, refPath);
+    }
     return out;
   };
   // The definition containers are root keywords; deeper down a key named
   // "definitions" is most likely a property name (data), so only the root pair goes.
   const { $defs, definitions, ...schema } = root;
   return walk(schema, []);
+}
+
+// A pathologically deep schema overflows the JS stack in either walker; that is the
+// caller's bad input (400), not a server fault (the RangeError would surface as 502).
+function toResponseSchema(schema) {
+  try {
+    return normalizeSchemaTypes(inlineSchemaRefs(schema), true);
+  } catch (error) {
+    if (error instanceof RangeError) throw schemaRejection('schema nesting too deep');
+    throw error;
+  }
 }
 
 const STOP_MAP = {
@@ -208,7 +232,7 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     const fmt = response_format.type;
     if (fmt === 'json_schema' && response_format.json_schema?.schema && typeof response_format.json_schema.schema === 'object') {
       generationConfig.responseMimeType = 'application/json';
-      generationConfig.responseSchema = normalizeSchemaTypes(inlineSchemaRefs(response_format.json_schema.schema), true);
+      generationConfig.responseSchema = toResponseSchema(response_format.json_schema.schema);
     } else if (fmt === 'json_object' || fmt === 'json') {
       generationConfig.responseMimeType = 'application/json';
     }
