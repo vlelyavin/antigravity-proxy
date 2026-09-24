@@ -3,13 +3,29 @@ import { openAiToAntigravity } from '../rewrite/openai-translate.js';
 import { dropIdleSockets, makeEgressAgent } from './egress.js';
 
 export class UpstreamError extends Error {
-  constructor(message, { status = 502, retryable = false, accountId = null } = {}) {
+  constructor(message, { status = 502, retryable = false, accountId = null, kind = 'other' } = {}) {
     super(message);
     this.name = 'UpstreamError';
     this.status = status;
     this.retryable = retryable;
     this.accountId = accountId;
+    // rotation keys off this (quota -> cooldown + next account, auth -> invalidate + next account)
+    this.kind = kind;
   }
+}
+
+/** Rejects once the signal aborts; the underlying work (a shared token refresh) keeps running. */
+function abortable(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error('aborted'));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
 }
 
 /**
@@ -40,6 +56,8 @@ export class UpstreamClient {
 
   /** Raw request honoring egress: returns a fetch-like Response (body is a stream). */
   async request(url, { method = 'POST', headers = {}, body, signal }) {
+    // an abort listener added after the fact never fires: refuse to start an already aborted request
+    if (signal?.aborted) throw new Error('aborted');
     const egressUrl = this.config.upstream.egress?.url ?? null;
     if (!egressUrl) {
       return globalThis.fetch(url, { method, headers, body, signal });
@@ -178,8 +196,8 @@ export class UpstreamClient {
    * Non-streaming generate. Returns parsed JSON of the antigravity response.
    */
   async generate({ openAiBody, account, fetchImpl = globalThis.fetch, signal }) {
-    const token = await this.accessToken(account, { fetchImpl });
-    const body = await this.buildBody(openAiBody, account);
+    const token = await abortable(this.accessToken(account, { fetchImpl }), signal);
+    const body = await abortable(this.buildBody(openAiBody, account), signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:generateContent`;
     return this.#doFetch({ url, token, body, account, fetchImpl, signal, stream: false });
   }
@@ -189,8 +207,8 @@ export class UpstreamClient {
    * pipes frames. Uses streamGenerateContent?alt=sse.
    */
   async generateStream({ openAiBody, account, fetchImpl = globalThis.fetch, signal }) {
-    const token = await this.accessToken(account, { fetchImpl });
-    const body = await this.buildBody(openAiBody, account);
+    const token = await abortable(this.accessToken(account, { fetchImpl }), signal);
+    const body = await abortable(this.buildBody(openAiBody, account), signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:streamGenerateContent?alt=sse`;
     return this.#doFetch({ url, token, body, account, fetchImpl, signal, stream: true });
   }

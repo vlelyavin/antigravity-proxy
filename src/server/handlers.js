@@ -27,8 +27,13 @@ export function errorResponse(res, status, message, type = 'invalid_request_erro
   res.end(body);
 }
 
-/** Runs an OpenAI-shaped request through the pool with rotation on quota/auth. */
-export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal, respondNative = false }) {
+/**
+ * Runs an OpenAI-shaped request through the pool with rotation on quota/auth.
+ * attemptTimeoutsMs (header x-attempt-timeouts-ms, non-stream only): the i-th account attempt is cut
+ * after attemptTimeoutsMs[i] (the last value repeats) and the request moves on to the next account;
+ * once the pool is spent, the Vertex relay answers within the client's own deadline.
+ */
+export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal, respondNative = false, attemptTimeoutsMs = [] }) {
   let lastError = null;
   let accounts = [];
   try {
@@ -46,15 +51,25 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
       lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
       break;
     }
+    const timeoutMs = openAiBody.stream ? null : attemptTimeoutsMs[Math.min(attempt, attemptTimeoutsMs.length - 1)];
+    const attemptSignal = timeoutMs
+      ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)].filter(Boolean))
+      : signal;
     try {
       if (openAiBody.stream) {
         await handleStream({ upstream, config, logger, account, openAiBody, res, signal });
       } else {
-        await handleNonStream({ upstream, config, logger, account, openAiBody, res, signal, respondNative });
+        await handleNonStream({ upstream, config, logger, account, openAiBody, res, signal: attemptSignal, respondNative });
       }
       return;
     } catch (error) {
       lastError = error;
+      if (timeoutMs && attemptSignal.aborted && !signal?.aborted) {
+        // a hung upstream: the next account (round-robin) gets the rest of the client's patience
+        lastError = new UpstreamError(`upstream attempt timed out after ${timeoutMs}ms`, { status: 504, accountId: account.id, kind: 'timeout' });
+        logger.warn('rotation.attempt_timeout', { account: account.email || account.id, attempt, timeoutMs });
+        continue;
+      }
       if (error instanceof UpstreamError) {
         if (error.kind === 'quota') {
           pool.cooldown(account.id, config.rotation.cooldownMs);

@@ -23,7 +23,7 @@ function fakeUpstream() {
         res.write(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'he' }] } }] } })}\n\n`);
         res.write(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'y' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 2, totalTokenCount: 4 } } })}\n\n`);
         res.end();
-      } else if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429') {
+      } else if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429' || parsed.project === 'p-exhausted') {
         res.writeHead(429, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
       } else {
@@ -103,21 +103,20 @@ test('stream chat completion emits OpenAI SSE chunks + [DONE]', async () => {
 test('429 rotates to the second account', async () => {
   const stack = await startStack({
     accounts: [
-      { id: 'q1', email: 'dead@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null },
+      { id: 'q1', email: 'dead@x', projectId: 'p-exhausted', refreshToken: 'r', accessToken: 't', expiry: null },
       { id: 'q2', email: 'alive@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null },
     ],
   });
   try {
-    // q1 selected first; its generate hits TRIGGER_429 via content text
-    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'TRIGGER_429' }] });
-    // the second attempt posts the same body to the same fake upstream, which still 429s
-    // -> rotation exhausted, response carries the upstream 429
-    assert.equal(res.status, 429);
-    // q1 must now be cooling down: next pick is q2, which answers normally
-    const res2 = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
-    assert.equal(res2.status, 200);
-    const json = await res2.json();
+    // q1 is selected first and answers 429: the same request moves on to q2
+    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200);
+    const json = await res.json();
     assert.equal(json.choices[0].message.content, 'pong');
+    // q1 is cooling down now; when every account 429s, the upstream 429 reaches the client
+    assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
+    const exhausted = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'TRIGGER_429' }] });
+    assert.equal(exhausted.status, 429);
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }

@@ -18,7 +18,7 @@ function fakeUpstream({ hangMs = 0, sse } = {}) {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const parsed = JSON.parse(body);
-      if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429') {
+      if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429' || parsed.project === 'p-exhausted') {
         res.writeHead(429, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
         return;
@@ -208,17 +208,18 @@ test('all-accounts-cooling fails fast with 429 (M9)', async () => {
 test('429 rotates to the second account (kind=quota)', async () => {
   const stack = await startStack({
     accounts: [
-      { id: 'q1', email: 'dead@x', projectId: 'p' },
+      { id: 'q1', email: 'dead@x', projectId: 'p-exhausted' },
       { id: 'q2', email: 'alive@x', projectId: 'p' },
     ],
   });
   try {
-    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'TRIGGER_429' }] });
-    assert.equal(res.status, 429);
-    const res2 = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
-    assert.equal(res2.status, 200);
-    const json = await res2.json();
+    // q1 is picked first and answers 429: the same request moves on to q2
+    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200);
+    const json = await res.json();
     assert.equal(json.choices[0].message.content, 'pong');
+    // and q1 sits out its cooldown
+    assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }

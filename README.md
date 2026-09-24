@@ -88,6 +88,8 @@ hermes / any openai sdk: `base_url=http://127.0.0.1:8317/v1`, `api_key=none`, mo
 
 put extra token files under `~/.antigravity-proxy/accounts/*.json` (shape: `{access_token, refresh_token, project_id?, email?}`). round-robin picks the next healthy account; a 429 puts that account on cooldown and retries the next. 2-3 accounts per residential exit ip is the sane ceiling — more looks like a farm, and google farms get recaptcha'd.
 
+a client that cannot wait out a hung upstream sends `x-attempt-timeouts-ms: 45000,30000` (non-stream only): the first account gets 45 s, the next one 30 s (the last value repeats), then the vertex fallback answers with whatever the client still waits. no header — no per-attempt cut, only `requestTimeoutMs`. mari sends it; hermes and opencode don't.
+
 ## systemd
 
 ```bash

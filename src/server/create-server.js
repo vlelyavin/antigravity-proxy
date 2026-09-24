@@ -31,6 +31,19 @@ function readBody(req, limitBytes = 32 * 1024 * 1024) {
   });
 }
 
+/**
+ * Opt-in per-attempt budget, e.g. `x-attempt-timeouts-ms: 45000,30000` (Mari): the i-th account attempt
+ * of a non-stream request is cut after the i-th value. Clamped to the upstream request timeout; an
+ * unparsable header is ignored, so a bad value never breaks a call.
+ */
+function attemptTimeouts(req, config) {
+  const raw = req.headers['x-attempt-timeouts-ms'];
+  if (typeof raw !== 'string' || raw.trim() === '') return [];
+  const values = raw.split(',').map((v) => Number(v.trim()));
+  if (values.some((v) => !Number.isInteger(v) || v <= 0)) return [];
+  return values.map((v) => Math.min(v, config.upstream.requestTimeoutMs));
+}
+
 export function createServer({ config, credentialStore, upstream, pool, logger }) {
   const server = http.createServer((req, res) => {
     // top-level guard: one malformed request must never take the process down
@@ -95,7 +108,10 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
       req.on('close', () => { if (!res.writableEnded) clientAbort.abort(new Error('client disconnected')); });
 
       try {
-        await handleWithRotation({ pool, store: credentialStore, upstream, config, logger, openAiBody, req, res, signal: clientAbort.signal });
+        await handleWithRotation({
+          pool, store: credentialStore, upstream, config, logger, openAiBody, req, res,
+          signal: clientAbort.signal, attemptTimeoutsMs: attemptTimeouts(req, config),
+        });
       } catch (error) {
         if (clientAbort.signal.aborted) {
           logger.warn('chat.client_aborted', { model: openAiBody.model });
@@ -134,7 +150,7 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
         await handleWithRotation({
           pool, store: credentialStore, upstream, config, logger,
           openAiBody, req, res, signal: clientAbort.signal,
-          respondNative: true,
+          respondNative: true, attemptTimeoutsMs: attemptTimeouts(req, config),
         });
       } catch (error) {
         if (clientAbort.signal.aborted) {
