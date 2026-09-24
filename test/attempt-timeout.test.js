@@ -108,11 +108,13 @@ test('when every account hangs, the Vertex relay answers', async () => {
 });
 
 test('without the header, or with a malformed one, a slow account is not cut', async () => {
-  const stack = await startStack(['p-slow', 'p-ok']);
+  // both accounts answer after 300 ms: a parsed 100 ms budget would cut both and land on Vertex
+  const stack = await startStack(['p-slow', 'p-slow']);
   try {
     assert.equal((await chat(stack.port)).content, 'pong:p-slow');
-    assert.equal((await chat(stack.port, { 'x-attempt-timeouts-ms': 'soon' })).content, 'pong:p-ok');
+    assert.equal((await chat(stack.port, { 'x-attempt-timeouts-ms': 'soon' })).content, 'pong:p-slow');
     assert.equal((await chat(stack.port, { 'x-attempt-timeouts-ms': '100,abc' })).content, 'pong:p-slow');
+    assert.equal((await chat(stack.port, { 'x-attempt-timeouts-ms': '100' })).content, 'vertex-ok');
   } finally {
     stack.close();
   }
