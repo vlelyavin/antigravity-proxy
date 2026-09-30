@@ -43,14 +43,16 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
     lastError = error;
   }
   const maxAttempts = Math.min(accounts.length, 3);
+  const tried = new Set();
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const account = pool.pick(accounts);
+    const account = pool.pick(accounts, tried);
     if (!account) {
       // all accounts cooling down: fail fast, do not hammer the exhausted pool
       lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
       break;
     }
+    tried.add(account.id);
     const timeoutMs = openAiBody.stream ? null : attemptTimeoutsMs[Math.min(attempt, attemptTimeoutsMs.length - 1)];
     const attemptSignal = timeoutMs
       ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)].filter(Boolean))
@@ -65,7 +67,7 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
     } catch (error) {
       lastError = error;
       if (timeoutMs && attemptSignal.aborted && !signal?.aborted) {
-        // a hung upstream: the next account (round-robin) gets the rest of the client's patience
+        // a hung upstream: the next untried account gets the rest of the client's patience
         lastError = new UpstreamError(`upstream attempt timed out after ${timeoutMs}ms`, { status: 504, accountId: account.id, kind: 'timeout' });
         logger.warn('rotation.attempt_timeout', { account: account.email || account.id, attempt, timeoutMs });
         continue;
@@ -140,6 +142,7 @@ async function handleNonStream({ upstream, logger, account, openAiBody, res, sig
     model: openAiBody.model,
     account: account.email || account.id,
     promptTokens: openAiJson.usage.prompt_tokens,
+    cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
     completionTokens: openAiJson.usage.completion_tokens,
   });
 }

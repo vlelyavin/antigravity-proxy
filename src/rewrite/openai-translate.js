@@ -322,8 +322,15 @@ export function antigravityToOpenAi(respJson, { model, stream = false }) {
       prompt_tokens: usageIn ?? 0,
       completion_tokens: (usageOut ?? 0) + (usageThink ?? 0),
       total_tokens: (usageIn ?? 0) + (usageOut ?? 0) + (usageThink ?? 0),
+      ...cachedDetails(usage),
     },
   };
+}
+
+/** Gemini implicit-cache hits (cachedContentTokenCount) in the OpenAI usage shape. */
+function cachedDetails(usage) {
+  const cached = usage?.cachedContentTokenCount;
+  return Number.isFinite(cached) ? { prompt_tokens_details: { cached_tokens: cached } } : {};
 }
 
 /** One SSE data frame (antigravity stream chunk) -> OpenAI stream chunk, or null when nothing to emit. */
@@ -373,6 +380,7 @@ export function antigravityChunkToOpenAiChunk(frameJson, { model, indexRef }) {
       prompt_tokens: usage.promptTokenCount ?? 0,
       completion_tokens: (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),
       total_tokens: usage.totalTokenCount ?? 0,
+      ...cachedDetails(usage),
     };
   }
   return chunk;

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { newSessionId } from '../credentials/oauth.js';
 import { openAiToAntigravity } from '../rewrite/openai-translate.js';
 import { dropIdleSockets, makeEgressAgent } from './egress.js';
@@ -54,11 +55,31 @@ export class UpstreamClient {
     return this.agents.get(egressUrl);
   }
 
+  /**
+   * The account's own exit: upstream.egress.accounts maps an account (email, else the credential
+   * file name) to its egress url, so each account reaches Google from its own IP. Unmapped
+   * accounts use upstream.egress.url.
+   */
+  egressFor(account) {
+    const egress = this.config.upstream.egress ?? {};
+    const perAccount = egress.accounts ?? {};
+    const byEmail = account?.email ? perAccount[account.email] : undefined;
+    const byFile = account?.id ? perAccount[path.basename(account.id)] : undefined;
+    return byEmail ?? byFile ?? egress.url ?? null;
+  }
+
+  /** fetch-shaped call through the account's egress (the oauth refresh must not leave from the host IP). */
+  #fetchVia(egressUrl) {
+    if (!egressUrl) return globalThis.fetch;
+    return (url, { method = 'GET', headers = {}, body } = {}) =>
+      this.request(url, { method, headers, body: body == null ? undefined : String(body), egressUrl });
+  }
+
   /** Raw request honoring egress: returns a fetch-like Response (body is a stream). */
-  async request(url, { method = 'POST', headers = {}, body, signal }) {
+  async request(url, { method = 'POST', headers = {}, body, signal, egressUrl: accountEgress }) {
     // an abort listener added after the fact never fires: refuse to start an already aborted request
     if (signal?.aborted) throw new Error('aborted');
-    const egressUrl = this.config.upstream.egress?.url ?? null;
+    const egressUrl = accountEgress !== undefined ? accountEgress : (this.config.upstream.egress?.url ?? null);
     if (!egressUrl) {
       return globalThis.fetch(url, { method, headers, body, signal });
     }
@@ -120,7 +141,7 @@ export class UpstreamClient {
     });
   }
 
-  async accessToken(account, { fetchImpl = globalThis.fetch } = {}) {
+  async accessToken(account, { fetchImpl = this.#fetchVia(this.egressFor(account)) } = {}) {
     const cached = this.tokens.get(account.id);
     const eager = this.config.upstream.eagerRefreshMs;
     if (cached && cached.expiresAt - Date.now() > eager) {
@@ -167,7 +188,7 @@ export class UpstreamClient {
       'content-type': 'application/json',
       'user-agent': this.config.upstream.userAgent,
     };
-    const response = await this.request(url, { method: 'POST', headers, body });
+    const response = await this.request(url, { method: 'POST', headers, body, egressUrl: this.egressFor(account) });
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       throw new UpstreamError(`loadCodeAssist ${response.status}: ${text.slice(0, 200)}`, { status: response.status >= 500 ? 502 : response.status, retryable: false, accountId: account.id });
@@ -227,12 +248,13 @@ export class UpstreamClient {
       ...(stream ? { accept: 'text/event-stream' } : {}),
     };
     const payload = JSON.stringify(body);
+    const egressUrl = this.egressFor(account);
 
     // One retry, pre-flight failures only (H1): if any response bytes arrived,
     // the request reached the backend and a blind re-POST could double-bill.
     let preflightFailure = null;
     try {
-      const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined });
+      const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
       if (process.env.ANTIGRAVITY_DEBUG_BODY) {
@@ -251,7 +273,7 @@ export class UpstreamClient {
     // pooled socket, and the pool can hold more of them (23.09 03:43: the retry hit one too)
     for (const agent of this.agents.values()) dropIdleSockets(agent);
     try {
-      const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined });
+      const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
       throw this.#upstreamErrorFrom(response.status, text, account.id);

@@ -28,6 +28,12 @@ server.listen(config.listen.port, config.listen.host, () => {
     logger.info('credentials.loaded', {
       count: accounts.length,
       accounts: accounts.map((a) => a.email || a.id),
+      // exit per account, host:port only (a proxy url may carry credentials)
+      egress: accounts.map((a) => {
+        const url = upstream.egressFor(a);
+        if (!url) return 'direct';
+        try { const u = new URL(url); return `${u.protocol}//${u.host}`; } catch { return 'invalid'; }
+      }),
     });
   } catch (error) {
     logger.warn('credentials.missing', { error: error.message });

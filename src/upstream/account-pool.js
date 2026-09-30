@@ -1,13 +1,14 @@
 /**
- * Account rotation: round-robin over healthy accounts; an account that got a
- * 429 RESOURCE_EXHAUSTED (or 401 invalid_grant after refresh) sits out for
- * cooldownMs. Rotation state lives in memory and resets on restart.
+ * Sticky account selection: every request goes to the first healthy account in credential order;
+ * the next one takes over only when it is cooling down after a 429 RESOURCE_EXHAUSTED (or 401
+ * invalid_grant after refresh), or was already tried by this request. One account serving a run of
+ * requests keeps Gemini's implicit prompt cache warm — the cache is per account, and round-robin
+ * split it in half. Cooldown state lives in memory and resets on restart.
  */
 export class AccountPool {
   constructor({ logger }) {
     this.logger = logger;
     this.coolUntil = new Map(); // accountId -> epoch ms
-    this.cursor = 0;
   }
 
   healthy(accounts) {
@@ -18,13 +19,11 @@ export class AccountPool {
   /**
    * M9: when every account is cooling down, return null so the caller fails
    * fast with 429 instead of hammering the account that just got exhausted.
+   * `tried` holds the ids this request already attempted: a timed-out or failed
+   * attempt moves on to the next account instead of retrying the same one.
    */
-  pick(accounts) {
-    const pool = this.healthy(accounts);
-    if (pool.length === 0) return null;
-    const account = pool[this.cursor % pool.length];
-    this.cursor = (this.cursor + 1) % pool.length;
-    return account;
+  pick(accounts, tried = new Set()) {
+    return this.healthy(accounts).find((a) => !tried.has(a.id)) ?? null;
   }
 
   cooldown(accountId, ms) {

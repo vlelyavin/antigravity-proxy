@@ -42,11 +42,10 @@ test('config file overrides defaults', async () => {
   assert.equal(config.listen.port, 7000);
 });
 
-test('account pool rotates and cools down', () => {
+test('account pool sticks to the first account and moves on only after a cooldown', () => {
   const pool = new AccountPool({ logger: console });
   const accounts = [{ id: 'a' }, { id: 'b' }];
   assert.equal(pool.pick(accounts).id, 'a');
-  assert.equal(pool.pick(accounts).id, 'b');
   assert.equal(pool.pick(accounts).id, 'a');
   pool.cooldown('a', 60_000);
   assert.equal(pool.pick(accounts).id, 'b');
