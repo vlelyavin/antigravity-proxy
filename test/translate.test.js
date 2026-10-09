@@ -128,3 +128,29 @@ test('models payload lists the antigravity catalog', () => {
   assert.ok(payload.data.some((m) => m.id === 'gemini-3.8-flash-high'));
   assert.ok(payload.data.some((m) => m.id === 'claude-sonnet-4-6'));
 });
+
+test('a prompt-level block surfaces as content_filter with the reason, not as an empty stop', () => {
+  const blockedResponse = {
+    response: {
+      promptFeedback: { blockReason: 'PROHIBITED_CONTENT', blockReasonMessage: 'The prompt could not be submitted.' },
+      usageMetadata: { promptTokenCount: 7, totalTokenCount: 7 },
+    },
+  };
+  const out = antigravityToOpenAi(blockedResponse, { model: 'm' });
+  assert.equal(out.choices[0].finish_reason, 'content_filter');
+  assert.equal(out.choices[0].message.content, null);
+  assert.equal(out.choices[0].message.refusal, 'PROHIBITED_CONTENT: The prompt could not be submitted.');
+
+  const chunk = antigravityChunkToOpenAiChunk(blockedResponse, { model: 'm', indexRef: { count: 0, first: true } });
+  assert.equal(chunk.choices[0].finish_reason, 'content_filter');
+  assert.equal(chunk.choices[0].delta.refusal, 'PROHIBITED_CONTENT: The prompt could not be submitted.');
+  assert.equal(chunk.usage.prompt_tokens, 7);
+
+  // an answered request is untouched, even when the upstream attaches feedback to it
+  const ok = antigravityToOpenAi(
+    { response: { candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }], promptFeedback: { blockReason: 'OTHER' } } },
+    { model: 'm' },
+  );
+  assert.equal(ok.choices[0].finish_reason, 'stop');
+  assert.equal(ok.choices[0].message.refusal, undefined);
+});

@@ -111,6 +111,15 @@ const STOP_MAP = {
   OTHER: 'content_filter',
 };
 
+// A prompt-level block: zero candidates plus promptFeedback.blockReason (PROHIBITED_CONTENT,
+// SAFETY, BLOCKLIST…). Without this the client saw HTTP 200, empty content and "stop", and could
+// not tell a refusal from a glitch. Only the reason travels; the prompt is never echoed or logged.
+function promptBlock(wrapper) {
+  const feedback = wrapper?.promptFeedback;
+  if (!feedback?.blockReason || wrapper?.candidates?.length) return null;
+  return [feedback.blockReason, feedback.blockReasonMessage].filter(Boolean).join(': ');
+}
+
 function partsFromContent(content) {
   if (typeof content === 'string') {
     return content === '' ? [] : [{ text: content }];
@@ -302,7 +311,9 @@ export function antigravityToOpenAi(respJson, { model, stream = false }) {
   usageOut = usage.candidatesTokenCount ?? usage.totalTokenCount ?? null;
   usageThink = usage.thoughtsTokenCount ?? null;
 
+  const blocked = promptBlock(wrapper);
   const message = { role: 'assistant', content: text === '' ? null : text };
+  if (blocked) message.refusal = blocked;
   if (reasoning !== '') message.reasoning_content = reasoning;
   if (toolCalls.length > 0) {
     message.tool_calls = toolCalls;
@@ -316,7 +327,7 @@ export function antigravityToOpenAi(respJson, { model, stream = false }) {
     choices: [{
       index: 0,
       message,
-      finish_reason: STOP_MAP[candidate?.finishReason] ?? 'stop',
+      finish_reason: blocked ? 'content_filter' : (STOP_MAP[candidate?.finishReason] ?? 'stop'),
     }],
     usage: {
       prompt_tokens: usageIn ?? 0,
@@ -356,7 +367,8 @@ export function antigravityChunkToOpenAiChunk(frameJson, { model, indexRef }) {
       });
     }
   }
-  if (text === '' && reasoning === '' && toolCalls.length === 0 && !candidate.finishReason) return null;
+  const blocked = promptBlock(wrapper);
+  if (text === '' && reasoning === '' && toolCalls.length === 0 && !candidate.finishReason && !blocked) return null;
 
   const delta = {};
   if (indexRef.first) {
@@ -366,16 +378,18 @@ export function antigravityChunkToOpenAiChunk(frameJson, { model, indexRef }) {
   if (text !== '') delta.content = text;
   if (reasoning !== '') delta.reasoning_content = reasoning;
   if (toolCalls.length > 0) delta.tool_calls = toolCalls;
+  if (blocked) delta.refusal = blocked;
+  const finishReason = blocked ? 'content_filter' : (candidate.finishReason ? (STOP_MAP[candidate.finishReason] ?? 'stop') : null);
 
   const chunk = {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, delta, finish_reason: candidate.finishReason ? (STOP_MAP[candidate.finishReason] ?? 'stop') : null }],
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
   };
   const usage = wrapper?.usageMetadata;
-  if (candidate.finishReason && usage) {
+  if (finishReason && usage) {
     chunk.usage = {
       prompt_tokens: usage.promptTokenCount ?? 0,
       completion_tokens: (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),

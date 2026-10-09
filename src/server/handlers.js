@@ -144,6 +144,7 @@ async function handleNonStream({ upstream, logger, account, openAiBody, res, sig
     promptTokens: openAiJson.usage.prompt_tokens,
     cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
     completionTokens: openAiJson.usage.completion_tokens,
+    ...(openAiJson.choices[0].message.refusal ? { blocked: openAiJson.choices[0].message.refusal } : {}),
   });
 }
 
@@ -161,6 +162,7 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
   // which would swallow the error frame we want to send (H4)
   const decoder = new TextDecoder('utf8');
   let failed = null;
+  let blocked = null;
   try {
     for await (const chunk of upstreamResponse.body) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -175,6 +177,7 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
         try { frame = JSON.parse(payload); } catch { continue; }
         const openAiChunk = antigravityChunkToOpenAiChunk(frame, { model: openAiBody.model, indexRef });
         if (openAiChunk) {
+          blocked ??= openAiChunk.choices[0].delta.refusal ?? null;
           if (!res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`)) {
             await once(res, 'drain'); // backpressure
           }
@@ -194,5 +197,5 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
       res.end();
     }
   }
-  logger.info('chat.streamed', { model: openAiBody.model, account: account.email || account.id });
+  logger.info('chat.streamed', { model: openAiBody.model, account: account.email || account.id, ...(blocked ? { blocked } : {}) });
 }
