@@ -14,7 +14,7 @@ openai client (hermes / opencode / curl)
 │         │                                 │
 │  server/handlers.js                       │
 │    ├─ rotation loop (up to 3 accounts)    │
-│    ├─ non-stream: json in/out             │
+│    ├─ non-stream: json out (split/stitch) │
 │    └─ stream: SSE in / SSE out            │
 │         │                                 │
 │  rewrite/openai-translate.js              │
