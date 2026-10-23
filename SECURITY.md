@@ -1,23 +1,16 @@
 # Security Policy
 
-## reporting
+## Reporting
 
-open a GitHub issue or email the repo owner. do not include token files or
-request payloads containing personal data in reports.
+To report a security issue, open a GitHub issue or email the repository owner. Do not include token files or request payloads containing sensitive or personal data in your reports.
 
-## scope
+## Scope
 
-- this relay runs locally and reads your own oauth token files. nothing is
-  transmitted anywhere except `oauth2.googleapis.com` (token refresh) and the
-  configured cloud-code backend.
-- the public oauth client id/secret embedded in `src/credentials/oauth.js`
-  are Google's own publicly distributed identifiers, present in every
-  antigravity/gemini cli install. they are not credentials of this project.
+- This relay runs locally and only reads your local OAuth token files. No data is transmitted anywhere other than `oauth2.googleapis.com` (for token refreshes) and the configured Cloud Code backend.
+- The public OAuth client ID and secret embedded in `src/credentials/oauth.js` are Google's publicly distributed identifiers, present in every Antigravity/Gemini CLI installation. They are not private credentials of this project.
 
-## hardening checklist
+## Hardening Checklist
 
-- keep the relay on 127.0.0.1; if you must expose it, set `apiKey` and put
-  tls in front (the relay speaks plain http).
-- never commit `config.json`, token files, or anything under `accounts/`.
-- a leaked refresh token = revoke it (google account → security → third-party
-  access) and re-login.
+- Keep the relay bound to `127.0.0.1`. If you must expose it, set an `apiKey` and terminate TLS in front of it (the relay serves plain HTTP).
+- Never commit `config.json`, token files, or any files under `accounts/`.
+- If a refresh token is leaked, revoke it immediately (Google Account → Security → Third-party access) and log in again.

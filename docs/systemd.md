@@ -1,10 +1,10 @@
 # systemd
 
-the installer (`sudo ./scripts/install-systemd.sh`) writes and starts a user unit. manual version:
+The installer script (`sudo ./scripts/install-systemd.sh`) sets up and starts a systemd user unit automatically. To configure it manually:
 
-## user unit
+## User unit
 
-create `~/.config/systemd/user/antigravity-proxy.service`:
+Create `~/.config/systemd/user/antigravity-proxy.service`:
 
 ```ini
 [Unit]
@@ -22,40 +22,40 @@ Environment=NO_PROXY=*
 WantedBy=default.target
 ```
 
-enable + start:
+Reload the systemd user daemon, then enable and start the service:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now antigravity-proxy.service
 ```
 
-linger, so it survives logout:
+Enable lingering so the process persists after logout:
 
 ```bash
 loginctl enable-linger "$USER"
 ```
 
-check:
+Verify that the service is running and healthy:
 
 ```bash
 systemctl --user status antigravity-proxy
 curl -sS http://127.0.0.1:8317/health
 ```
 
-logs:
+Follow the logs:
 
 ```bash
 journalctl --user -u antigravity-proxy -f
 ```
 
-## configuration
+## Configuration
 
-either edit `config.json` (copy from `config.example.json`) or use env vars in the unit:
+You can either edit `config.json` (copy it from `config.example.json`) or define environment variables directly in the service unit:
 
-| env | meaning | default |
+| Variable | Description | Default |
 |---|---|---|
-| `ANTIGRAVITY_PROXY_PORT` | listen port | 8317 |
-| `ANTIGRAVITY_PROXY_HOST` | listen host | 127.0.0.1 |
-| `ANTIGRAVITY_PROXY_API_KEY` | require this key from clients | none |
-| `ANTIGRAVITY_PROXY_LOG_LEVEL` | debug/info/warn/error | info |
-| `ANTIGRAVITY_PROXY_UPSTREAM` | override cloud-code base url | daily-cloudcode-pa.googleapis.com |
+| `ANTIGRAVITY_PROXY_PORT` | Listen port | 8317 |
+| `ANTIGRAVITY_PROXY_HOST` | Listen host | 127.0.0.1 |
+| `ANTIGRAVITY_PROXY_API_KEY` | API key required from clients | none |
+| `ANTIGRAVITY_PROXY_LOG_LEVEL` | Log level (debug/info/warn/error) | info |
+| `ANTIGRAVITY_PROXY_UPSTREAM` | Override Cloud Code base URL | daily-cloudcode-pa.googleapis.com |

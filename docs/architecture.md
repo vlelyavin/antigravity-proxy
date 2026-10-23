@@ -1,4 +1,4 @@
-# architecture
+# Architecture
 
 ```
 openai client (hermes / opencode / curl)
@@ -39,16 +39,11 @@ openai client (hermes / opencode / curl)
 https://daily-cloudcode-pa.googleapis.com/v1internal:*
 ```
 
-## why the daily host
+## Why the daily host
 
-the prod host (`cloudcode-pa.googleapis.com`) answers `429 RESOURCE_EXHAUSTED`
-to request shapes that don't come from a real antigravity client, even when
-`retrieveUserQuota` shows full quota remaining. the `daily-` mirror (the host
-the antigravity IDE and CLIProxyAPI actually use) accepts the same shape with
-`200`. both hosts accept identical auth; the mirror is the default here and
-`ANTIGRAVITY_PROXY_UPSTREAM` can override it.
+The production host (`cloudcode-pa.googleapis.com`) returns `429 RESOURCE_EXHAUSTED` for requests that do not come from an authentic Antigravity client, even when `retrieveUserQuota` shows remaining quota. In contrast, the `daily-` mirror (the endpoint used by the Antigravity IDE and CLIProxyAPI) accepts the exact same payload with a `200` response. Both hosts use identical authentication. The proxy defaults to the daily mirror, which can be overridden via `ANTIGRAVITY_PROXY_UPSTREAM`.
 
-## the antigravity wire shape (what the relay builds)
+## The Antigravity wire shape (what the relay builds)
 
 ```json
 {
@@ -65,23 +60,15 @@ the antigravity IDE and CLIProxyAPI actually use) accepts the same shape with
 }
 ```
 
-- `userAgent: "antigravity"` + `User-Agent: antigravity/hub/<ver> ...` header
-  are what select the lane. a GeminiCLI user-agent on the same endpoint gets
-  `403 no valid license`.
-- thinking models burn `maxOutputTokens` on thoughts: a tiny budget yields
-  `finishReason: MAX_TOKENS` with empty content. size budgets accordingly.
+- The `userAgent: "antigravity"` property and the `User-Agent: antigravity/hub/<ver> ...` header route the request to the proper backend lane. A GeminiCLI user agent sent to this endpoint fails with `403 no valid license`.
+- Thinking models consume `maxOutputTokens` on internal reasoning. An insufficient budget leads to `finishReason: MAX_TOKENS` with an empty response content; size token budgets accordingly.
 
-## oauth
+## OAuth
 
-- tokens come from the antigravity cli (`agy`) or gemini cli files; both
-  refresh through `oauth2.googleapis.com/token` with the public embedded
-  client id/secret of the antigravity cli.
-- the store re-reads the files per request, so re-logging in elsewhere
-  refreshes the relay without a restart.
-- access tokens are cached in memory and refreshed 5 minutes before expiry.
+- Tokens are loaded from Antigravity CLI (`agy`) or Gemini CLI credential files. Both refresh via `oauth2.googleapis.com/token` using the public client ID and secret embedded in the Antigravity CLI.
+- The credential store re-reads files on every request, so re-authenticating in another terminal updates the relay without requiring a restart.
+- Access tokens are cached in memory and proactively refreshed 5 minutes before expiration.
 
-## project id
+## Project ID
 
-some token files carry `project_id`; the code-assist onboarding project
-(`aicode-consumers...`) is what the backend bills quota against. files without
-one still work — the backend resolves the project from the account.
+Some token files include a `project_id`. Quota usage is billed against the Code Assist onboarding project (`aicode-consumers...`). Files without this field continue to work normally, as the backend resolves the project from the account.

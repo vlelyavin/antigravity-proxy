@@ -2,35 +2,35 @@
 
 [README на русском](README.ru.md)
 
-you have a google ai pro subscription. your tools want an openai endpoint. this sits in the middle: a local relay that pushes openai chat-completions through your antigravity / code-assist oauth, so hermes / opencode / anything-openai rides on the sub instead of a per-token bill.
+If you have a Google AI Pro subscription but your developer tools expect an OpenAI-compatible endpoint, this project bridges the gap. It is a lightweight local relay that proxies OpenAI `chat/completions` requests through your Antigravity or Code Assist OAuth credentials, letting tools like Hermes, OpenCode, or any OpenAI-compatible client run on your existing subscription instead of racking up per-token API bills.
 
 ## what it does
 
-- reads your local antigravity/gemini oauth token from disk on every request — a fresh login elsewhere needs no restart
-- translates openai `chat/completions` ↔ cloud code `generateContent` structurally, both directions, including tool calls and images
-- streams: openai SSE out of the cloud-code SSE frames
-- multi-account round-robin with 429 cooldown — drop N token files in and it rotates
-- retries 5xx/network with backoff; quota errors rotate accounts instead of failing the request
-- optional api key so the port isn't a free-for-all on your lan
-- zero npm dependencies. node stdlib, nothing else.
+- **Hot-reloads credentials**: Reads your local Antigravity/Gemini OAuth token from disk on every request. Re-authenticating in another tool takes effect immediately without restarting the proxy.
+- **Bi-directional translation**: Handles structural conversion between OpenAI `chat/completions` and Cloud Code `generateContent` formats, including tool calls and image payloads.
+- **Real-time streaming**: Re-encodes Cloud Code SSE frames into OpenAI-compatible SSE streams on the fly.
+- **Multi-account rotation**: Distributes requests across multiple accounts with automatic cooldowns on HTTP 429 (rate-limit) errors. Drop in multiple token files, and the proxy will round-robin between them.
+- **Resilient retries**: Automatically retries on 5xx errors and network failures with exponential backoff. When an account hits quota limits, the proxy fails over to the next available account instead of dropping the request.
+- **Local access control**: Optional API key support to prevent unauthorized access across your local network.
+- **Zero dependencies**: Built entirely on the Node.js standard library with no external npm packages.
 
 ## what it is not
 
-- not a google product, not affiliated with them
-- not a hosted service — runs on your machine, your creds
-- not a cred bundle — nothing private ships in this repo
+- Not an official Google product and not affiliated with Google in any way.
+- Not a hosted service: it runs entirely on your local machine using your own credentials.
+- Not a credential source: this repository contains no tokens, credentials, or private keys.
 
 ## straight talk
 
-it uses subscription oauth outside the official client. that's a gray zone in google's tos — same club as every code-assist proxy. hammer it and you can lose the subscription; the quota is per-user (~1500 req/day on ai pro), and one agentic prompt can burn several requests. your call.
+This proxy relies on subscription OAuth credentials outside the official client workflow. This sits in a gray area regarding Google's Terms of Service, alongside other third-party Code Assist tooling. Aggressive use or quota abuse can put your subscription at risk of suspension. The daily quota is shared per user (~1,500 requests/day on AI Pro), and iterative agentic loops can consume requests rapidly. Use it at your own discretion.
 
 ## requirements
 
-- node 20+ (no build step, no npm install)
-- a local oauth token from one of:
-  - **antigravity cli** (`agy`) → `~/.gemini/antigravity-cli/antigravity-oauth-token`
-  - **gemini cli** (`npm i -g @google/gemini-cli && gemini`) → `~/.gemini/oauth_creds.json`
-  - any file with `{access_token, refresh_token, project_id?}` placed under `~/.antigravity-proxy/accounts/*.json`
+- Node.js 20+ (no build step, no `npm install` required)
+- A local OAuth token from any of the following:
+  - **antigravity cli** (`agy`): `~/.gemini/antigravity-cli/antigravity-oauth-token`
+  - **gemini cli** (`npm i -g @google/gemini-cli && gemini`): `~/.gemini/oauth_creds.json`
+  - Any custom JSON file containing `{access_token, refresh_token, project_id?}` saved under `~/.antigravity-proxy/accounts/*.json`
 
 ## run
 
@@ -40,13 +40,17 @@ cd antigravity-proxy
 node src/cli.js
 ```
 
-listens on `127.0.0.1:8317`.
+The server listens on `127.0.0.1:8317` by default.
+
+Verify the status and inspect discovered accounts:
 
 ```bash
 curl -sS http://127.0.0.1:8317/health
 ```
 
-health lists every account it found and token expiry. then:
+The health check response will list all detected accounts and their token expiration times.
+
+Send a test completion:
 
 ```bash
 curl -sS http://127.0.0.1:8317/v1/chat/completions \
@@ -54,13 +58,13 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
   --data '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"reply with exactly: pong"}]}'
 ```
 
-a `pong` means the whole path works.
+Receiving `pong` confirms that credentials, translation, and upstream connectivity are fully operational.
 
 ## wire it into tools
 
-openai-compatible base url `http://127.0.0.1:8317/v1`, api key — whatever you set (or `none`).
+Set the OpenAI-compatible base URL to `http://127.0.0.1:8317/v1`. If you configured an API key, provide it here; otherwise, use any non-empty placeholder like `none`.
 
-opencode:
+OpenCode configuration:
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
@@ -78,17 +82,17 @@ opencode:
 }
 ```
 
-hermes / any openai sdk: `base_url=http://127.0.0.1:8317/v1`, `api_key=none`, model ids from `GET /v1/models`.
+For Hermes or standard OpenAI SDKs: configure `base_url=http://127.0.0.1:8317/v1`, set `api_key=none`, and query `GET /v1/models` for available model IDs.
 
 ## models
 
-`gemini-3.8-flash-{low,medium,high}`, `gemini-3.7/3.6-flash-*`, `gemini-3-flash`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. the list lives in `src/rewrite/models.js` — extend it when google ships more.
+Supported model IDs include `gemini-3.8-flash-{low,medium,high}`, `gemini-3.7/3.6-flash-*`, `gemini-3-flash`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, and `gpt-oss-120b-medium`. The full registry is defined in `src/rewrite/models.js` and can be expanded as new models become available upstream.
 
 ## multi-account
 
-put extra token files under `~/.antigravity-proxy/accounts/*.json` (shape: `{access_token, refresh_token, project_id?, email?}`). round-robin picks the next healthy account; a 429 puts that account on cooldown and retries the next. 2-3 accounts per residential exit ip is the sane ceiling — more looks like a farm, and google farms get recaptcha'd.
+To use multiple accounts, place token files in `~/.antigravity-proxy/accounts/*.json` matching the structure `{access_token, refresh_token, project_id?, email?}`. The proxy will cycle through healthy accounts via round-robin. If an account returns HTTP 429, it enters a cooldown window and the proxy immediately retries the request using the next available account. A practical guideline is keeping 2-3 accounts per residential IP; running larger pools from a single IP increases the risk of CAPTCHAs or quota blocks.
 
-a client that cannot wait out a hung upstream sends `x-attempt-timeouts-ms: 45000,30000` (non-stream only): the first account gets 45 s, the next one 30 s (the last value repeats), then the vertex fallback answers with whatever the client still waits. no header — no per-attempt cut, only `requestTimeoutMs`. mari sends it; hermes and opencode don't.
+For clients sensitive to upstream latency, you can specify per-attempt timeouts via the `x-attempt-timeouts-ms` header (supported on non-streaming requests only), e.g., `x-attempt-timeouts-ms: 45000,30000`. In this case, the first attempt times out after 45 seconds, the second after 30 seconds (repeating for subsequent attempts), after which any configured Vertex fallback will consume the remaining client timeout budget. If omitted, attempts follow the default global `requestTimeoutMs`. (For example, Mari supplies this header, while Hermes and OpenCode rely on standard timeouts.)
 
 ## systemd
 
@@ -96,25 +100,25 @@ a client that cannot wait out a hung upstream sends `x-attempt-timeouts-ms: 4500
 sudo ./scripts/install-systemd.sh
 ```
 
-one command — writes the unit, enables, starts. manual path in `docs/systemd.md`.
+This script generates the systemd unit file, enables it, and starts the service. Manual setup instructions are documented in `docs/systemd.md`.
 
 ## structure
 
 ```
 src/
-  config/         defaults, env overrides, loader
-  credentials/    token file lookup (agy / gemini-cli / raw), oauth refresh
-  rewrite/        openai <-> cloud-code transforms + model catalog
-  upstream/       cloud-code client with retry, account pool with cooldown
-  server/         http surface: /health, /v1/models, /v1/chat/completions
-test/             34 tests, no network needed
+  config/         Configuration defaults, environment variable overrides, loader
+  credentials/    Token discovery (agy, gemini-cli, raw JSON) and OAuth refresh handling
+  rewrite/        OpenAI <-> Cloud Code transforms and model catalog
+  upstream/       Cloud Code client with retry logic and account rotation pool
+  server/         HTTP routing: /health, /v1/models, /v1/chat/completions
+test/             34 test cases, fully offline (no network required)
 ```
 
 ## security
 
-- localhost only, unless you know exactly why not
-- never commit token files or config.json
-- set `apiKey` in config.json if anything besides your own machine can reach the port
+- Bind to `127.0.0.1` unless you have an explicit network architecture requiring external exposure.
+- Never commit credentials, token files, or `config.json` to version control.
+- Configure an `apiKey` in `config.json` if the port is reachable by other devices on your local network.
 
 ## license
 
