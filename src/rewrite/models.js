@@ -4,6 +4,7 @@
 // -1 budget = dynamic thinking; pro-high is a client-side alias that maps to
 // the upstream model id "gemini-pro-agent" with a 10001 budget.
 export const MODEL_CATALOG = [
+  { id: 'gemini-3.8-flash', context: 1_048_576, budget: 4000, maxOutputTokens: 65_536, upstreamModel: 'gemini-3.8-flash-medium' },
   { id: 'gemini-3.8-flash-low', context: 1_048_576, budget: 1000, maxOutputTokens: 65_536 },
   { id: 'gemini-3.8-flash-medium', context: 1_048_576, budget: 4000, maxOutputTokens: 65_536 },
   { id: 'gemini-3.8-flash-high', context: 1_048_576, budget: -1, maxOutputTokens: 65_536 },

@@ -42,7 +42,9 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
     // missing/corrupt credential files: the pool is empty — still fall back
     lastError = error;
   }
-  const maxAttempts = Math.min(accounts.length, 3);
+  // 2026-10-19: перебор ВСЕХ аккаунтов, а не трёх. Мари не должна видеть 429,
+  // пока в пуле есть живые аккаунты (7 аккаунтов, 3 попытки = 4 живых простаивали).
+  const maxAttempts = accounts.length;
   const tried = new Set();
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -81,6 +83,17 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
         if (error.kind === 'auth') {
           upstream.invalidate(account.id);
           logger.warn('rotation.auth', { account: account.email || account.id, attempt });
+          continue;
+        }
+        // 2026-10-17: transient lane/proxy failures (502/504 before any bytes were written)
+        // must fail over to the next account instead of surfacing a break to the client.
+        // A dead Mullvad lane on the sticky account otherwise aborts every request for
+        // the whole cooldown window.
+        if ((error.status === 502 || error.status === 504) && !res.headersSent) {
+          pool.cooldown(account.id, Math.min(config.rotation.cooldownMs, 60_000));
+          logger.warn('rotation.transient', {
+            account: account.email || account.id, attempt, status: error.status, message: error.message,
+          });
           continue;
         }
       }
@@ -122,7 +135,103 @@ async function tryVertexFallback({ config, logger, openAiBody, res, signal, resp
   }
 }
 
+// non-stream клиенту отдаём обычный JSON, но к апстриму идём стримом:
+// generateContent собирает ответ целиком и на длинных текстах выходит за
+// любой разумный таймаут, streamGenerateContent отдаёт те же данные первого
+// токена за секунды. Функция склеивает дельты в один completion.
+async function collectCompletion({ upstream, openAiBody, account, signal, model }) {
+  const upstreamResponse = await upstream.generateStream({ openAiBody, account, signal });
+  // апстрим иногда отвечает обычным JSON даже на sse-эндпоинт: не ломаемся.
+  // Обёртки без headers/body (mari-router) тоже встречаются - проверяем мягко.
+  const hasHeaders = upstreamResponse.headers && typeof upstreamResponse.headers.get === "function";
+  const type = hasHeaders ? upstreamResponse.headers.get("content-type") || "" : "";
+  const hasStream = upstreamResponse.body && typeof upstreamResponse.body[Symbol.asyncIterator] === "function";
+  if ((hasHeaders && !type.includes("text/event-stream")) || !hasStream) {
+    return antigravityToOpenAi(await upstreamResponse.json(), { model });
+  }
+  const decoder = new TextDecoder('utf8');
+  const indexRef = { count: 0, first: true };
+  const toolCalls = new Map();
+  let buffer = '';
+  let id = null;
+  let content = '';
+  let reasoning = '';
+  let finishReason = null;
+  let usage = null;
+
+  for await (const chunk of upstreamResponse.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      buffer = buffer.slice(idx + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      let frame;
+      try { frame = JSON.parse(payload); } catch { continue; }
+      const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
+      if (!out) continue;
+      id ??= out.id;
+      if (out.usage) usage = out.usage;
+      const choice = out.choices && out.choices[0];
+      if (!choice) continue;
+      const delta = choice.delta || {};
+      if (typeof delta.content === 'string') content += delta.content;
+      if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
+      for (const call of delta.tool_calls || []) {
+        const slot = toolCalls.get(call.index) || { id: '', name: '', arguments: '' };
+        if (call.id) slot.id = call.id;
+        if (call.function?.name) slot.name += call.function.name;
+        if (call.function?.arguments) slot.arguments += call.function.arguments;
+        toolCalls.set(call.index, slot);
+      }
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+    }
+  }
+
+  if (id === null && !content && !reasoning && toolCalls.size === 0) {
+    throw new Error('upstream stream produced no frames');
+  }
+
+  const message = { role: 'assistant', content: content || (toolCalls.size ? null : '') };
+  if (reasoning) message.reasoning_content = reasoning;
+  if (toolCalls.size) {
+    message.tool_calls = [...toolCalls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([index, call]) => ({
+        id: call.id || `call_${index}`,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments || '{}' },
+      }));
+  }
+  return {
+    id: id || `chatcmpl-${Date.now().toString(36)}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, logprobs: null, finish_reason: finishReason || 'stop' }],
+    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
+
 async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false }) {
+  if (!respondNative) {
+    const openAiJson = await collectCompletion({ upstream, openAiBody, account, signal, model: openAiBody.model });
+    const body = JSON.stringify(openAiJson);
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+    res.end(body);
+    logger.info('chat.completed', {
+      model: openAiBody.model,
+      effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
+      account: account.email || account.id,
+      promptTokens: openAiJson.usage.prompt_tokens,
+      cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
+      completionTokens: openAiJson.usage.completion_tokens,
+      ...(openAiJson.choices[0].message.refusal ? { blocked: openAiJson.choices[0].message.refusal } : {}),
+    });
+    return;
+  }
   const upstreamResponse = await upstream.generate({ openAiBody, account, signal });
   const json = await upstreamResponse.json();
   if (respondNative) {
@@ -131,7 +240,7 @@ async function handleNonStream({ upstream, logger, account, openAiBody, res, sig
     const body = JSON.stringify(nativeJson);
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
     res.end(body);
-    logger.info('native.completed', { model: openAiBody.model, account: account.email || account.id });
+    logger.info('native.completed', { model: openAiBody.model, effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null, account: account.email || account.id });
     return;
   }
   const openAiJson = antigravityToOpenAi(json, { model: openAiBody.model });
@@ -140,6 +249,7 @@ async function handleNonStream({ upstream, logger, account, openAiBody, res, sig
   res.end(body);
   logger.info('chat.completed', {
     model: openAiBody.model,
+    effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
     account: account.email || account.id,
     promptTokens: openAiJson.usage.prompt_tokens,
     cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
@@ -197,5 +307,5 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
       res.end();
     }
   }
-  logger.info('chat.streamed', { model: openAiBody.model, account: account.email || account.id, ...(blocked ? { blocked } : {}) });
+  logger.info('chat.streamed', { model: openAiBody.model, effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null, account: account.email || account.id, ...(blocked ? { blocked } : {}) });
 }

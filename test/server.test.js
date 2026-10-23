@@ -18,14 +18,16 @@ function fakeUpstream() {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const parsed = JSON.parse(body);
+      if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429' || parsed.project === 'p-exhausted') {
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
+        return;
+      }
       if (req.url.includes('streamGenerateContent')) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'he' }] } }] } })}\n\n`);
         res.write(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'y' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 2, totalTokenCount: 4 } } })}\n\n`);
         res.end();
-      } else if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429' || parsed.project === 'p-exhausted') {
-        res.writeHead(429, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
       } else {
         const reply = parsed.request.contents[0].parts[0].text === 'ECHO_MODEL'
           ? `MODEL:${parsed.model}`
@@ -77,8 +79,8 @@ test('non-stream chat completion round-trips through the fake upstream', async (
     const res = await post(stack.port, '/v1/chat/completions', { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);
     const json = await res.json();
-    assert.equal(json.choices[0].message.content, 'pong');
-    assert.equal(json.usage.total_tokens, 3);
+    assert.equal(json.choices[0].message.content, 'hey');
+    assert.equal(json.usage.total_tokens, 4);
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }
@@ -112,7 +114,7 @@ test('429 rotates to the second account', async () => {
     const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);
     const json = await res.json();
-    assert.equal(json.choices[0].message.content, 'pong');
+    assert.equal(json.choices[0].message.content, 'hey');
     // q1 is cooling down now; when every account 429s, the upstream 429 reaches the client
     assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
     const exhausted = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'TRIGGER_429' }] });

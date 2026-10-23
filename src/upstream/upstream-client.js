@@ -177,10 +177,10 @@ export class UpstreamClient {
    * loadCodeAssist probe (ideType ANTIGRAVITY) — same flow as the CLIProxyAPI
    * antigravity auth (auth.go FetchProjectID). Cached in memory per account.
    */
-  async ensureProject(account, { fetchImpl = globalThis.fetch } = {}) {
+  async ensureProject(account, { fetchImpl } = {}) {
     if (account.projectId) return account.projectId;
     if (this.projects.has(account.id)) return this.projects.get(account.id);
-    const token = await this.accessToken(account, { fetchImpl });
+    const token = await this.accessToken(account, fetchImpl ? { fetchImpl } : {});
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:loadCodeAssist`;
     const body = JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } });
     const headers = {
@@ -216,8 +216,8 @@ export class UpstreamClient {
   /**
    * Non-streaming generate. Returns parsed JSON of the antigravity response.
    */
-  async generate({ openAiBody, account, fetchImpl = globalThis.fetch, signal }) {
-    const token = await abortable(this.accessToken(account, { fetchImpl }), signal);
+  async generate({ openAiBody, account, fetchImpl, signal }) {
+    const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl } : {}), signal);
     const body = await abortable(this.buildBody(openAiBody, account), signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:generateContent`;
     return this.#doFetch({ url, token, body, account, fetchImpl, signal, stream: false });
@@ -227,8 +227,8 @@ export class UpstreamClient {
    * Streaming generate. Returns the raw upstream Response (SSE body) — the caller
    * pipes frames. Uses streamGenerateContent?alt=sse.
    */
-  async generateStream({ openAiBody, account, fetchImpl = globalThis.fetch, signal }) {
-    const token = await abortable(this.accessToken(account, { fetchImpl }), signal);
+  async generateStream({ openAiBody, account, fetchImpl, signal }) {
+    const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl } : {}), signal);
     const body = await abortable(this.buildBody(openAiBody, account), signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:streamGenerateContent?alt=sse`;
     return this.#doFetch({ url, token, body, account, fetchImpl, signal, stream: true });

@@ -2,32 +2,35 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openAiToAntigravity } from '../src/rewrite/openai-translate.js';
 
-test('reasoning_effort overrides model-suffix thinking budget', () => {
-  const base = { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'hi' }] };
-  const low = openAiToAntigravity({ ...base, reasoning_effort: 'low' }, { projectId: 'p', sessionId: 's' });
-  assert.equal(low.request.generationConfig.thinkingConfig.thinkingBudget, 1000);
+const mk = (model, extra = {}) => openAiToAntigravity(
+  { model, messages: [{ role: 'user', content: 'hi' }], ...extra },
+  { projectId: 'p', sessionId: 's' },
+);
 
-  const medium = openAiToAntigravity({ ...base, reasoning_effort: 'medium' }, { projectId: 'p', sessionId: 's' });
-  assert.equal(medium.request.generationConfig.thinkingConfig.thinkingBudget, 4000);
+test('effort maps to thinkingLevel and the suffixed upstream id; no thinkingBudget', () => {
+  const low = mk('gemini-3.8-flash', { reasoning_effort: 'low' });
+  assert.equal(low.model, 'gemini-3.8-flash-low');
+  assert.equal(low.request.generationConfig.thinkingConfig.thinkingLevel, 'low');
+  assert.equal(low.request.generationConfig.thinkingConfig.thinkingBudget, undefined);
+  assert.equal(low.request.generationConfig.thinkingConfig.includeThoughts, true);
 
-  const high = openAiToAntigravity({ ...base, reasoning_effort: 'high' }, { projectId: 'p', sessionId: 's' });
-  assert.equal(high.request.generationConfig.thinkingConfig.thinkingBudget, -1);
+  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'medium' }).request.generationConfig.thinkingConfig.thinkingLevel, 'medium');
+  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'high' }).request.generationConfig.thinkingConfig.thinkingLevel, 'high');
 
-  // no effort -> catalog default (high model = dynamic)
-  const none = openAiToAntigravity({ ...base }, { projectId: 'p', sessionId: 's' });
-  assert.equal(none.request.generationConfig.thinkingConfig.thinkingBudget, -1);
-
-  // unknown effort -> catalog default
-  const weird = openAiToAntigravity({ ...base, reasoning_effort: 'ultra' }, { projectId: 'p', sessionId: 's' });
-  assert.equal(weird.request.generationConfig.thinkingConfig.thinkingBudget, -1);
+  for (const e of ['xhigh', 'ultra', 'max']) {
+    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).request.generationConfig.thinkingConfig.thinkingLevel, 'high', `effort=${e}`);
+  }
+  for (const e of ['none', 'minimal', 'off']) {
+    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).request.generationConfig.thinkingConfig.thinkingLevel, 'low', `effort=${e}`);
+  }
+  // owner rule: reasoning disabled behaves like low
+  assert.equal(mk('gemini-3.8-flash', { reasoning: { enabled: false } }).request.generationConfig.thinkingConfig.thinkingLevel, 'low');
+  // no effort -> no level (provider default)
+  assert.equal(mk('gemini-3.8-flash').request.generationConfig.thinkingConfig.thinkingLevel, undefined);
 });
 
-test('effort=low on a -low model keeps low budget; effort passes on pro alias too', () => {
-  const base = { model: 'gemini-3.8-flash-low', messages: [{ role: 'user', content: 'hi' }] };
-  const r = openAiToAntigravity({ ...base, reasoning_effort: 'high' }, { projectId: 'p', sessionId: 's' });
-  assert.equal(r.request.generationConfig.thinkingConfig.thinkingBudget, -1);
-
-  const pro = openAiToAntigravity({ model: 'gemini-3.1-pro-high', reasoning_effort: 'low', messages: [{ role: 'user', content: 'hi' }] }, { projectId: 'p', sessionId: 's' });
-  assert.equal(pro.request.generationConfig.thinkingConfig.thinkingBudget, 1000);
-  assert.equal(pro.model, 'gemini-pro-agent');
+test('effort overrides the requested suffix; pro alias resolves', () => {
+  assert.equal(mk('gemini-3.8-flash-low', { reasoning_effort: 'high' }).model, 'gemini-3.8-flash-high');
+  assert.equal(mk('gemini-3.1-pro-high').model, 'gemini-pro-agent');
+  assert.equal(mk('gemini-3.1-pro-high', { reasoning_effort: 'low' }).model, 'gemini-3.1-pro-low');
 });
