@@ -16,12 +16,24 @@ export const DEFAULTS = {
     // host answers 429 RESOURCE_EXHAUSTED to non-antigravity-shaped traffic
     baseUrl: 'https://daily-cloudcode-pa.googleapis.com',
     apiVersion: 'v1internal',
-    userAgent: 'antigravity/hub/2.9.1 darwin/arm64',
+    userAgent: (() => {
+      // Official Antigravity CLI wire UA, measured from agy 1.3.3 on 17.10.2026
+      // (system-vm, linux/arm64). The CLI reports its real host, so this relay
+      // does the same instead of claiming the old Hub client's darwin/arm64.
+      const version = process.env.AGY_CLI_VERSION || '1.3.3';
+      const build = process.env.AGY_CLI_BUILD || '996823801';
+      const osType = process.platform === 'darwin' ? 'darwin'
+        : process.platform === 'win32' ? 'windows' : 'linux';
+      const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+      return `antigravity/cli/${version} (aidev_client; os_type=${osType}; arch=${arch}; cl=${build}; auth_method=consumer)`;
+    })(),
     requestTimeoutMs: 120_000,
     // refresh the oauth access token 5 minutes before expiry
     eagerRefreshMs: 5 * 60 * 1000,
     // optional outbound proxy for ALL upstream traffic (hides the host IP):
     // url: 'socks5://127.0.0.1:1055' | 'http://user:pass@host:port' | null
+    // per-account override: accounts: { '<email>': '<proxy-url>', '<filename>.json': '<proxy-url>' }
+    // (matched by email or file BASENAME INCLUDING extension; unknown key = silently global)
     egress: { url: null },
   },
 

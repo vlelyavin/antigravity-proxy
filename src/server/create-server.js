@@ -38,7 +38,15 @@ function readBody(req, limitBytes = 32 * 1024 * 1024) {
  */
 function attemptTimeouts(req, config) {
   const raw = req.headers['x-attempt-timeouts-ms'];
-  if (typeof raw !== 'string' || raw.trim() === '') return [];
+  // 2026-10-19: без заголовка берём дефолт из rotation.attemptTimeoutsMs.
+  // Иначе зависший апстрим держит клиента до общего таймаута вместо перехода
+  // на следующий аккаунт - Мари видит таймаут там, где есть живые аккаунты.
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    const dflt = config.rotation && config.rotation.attemptTimeoutsMs;
+    return Array.isArray(dflt)
+      ? dflt.map((v) => Math.min(v, config.upstream.requestTimeoutMs))
+      : [];
+  }
   const values = raw.split(',').map((v) => Number(v.trim()));
   if (values.some((v) => !Number.isInteger(v) || v <= 0)) return [];
   return values.map((v) => Math.min(v, config.upstream.requestTimeoutMs));

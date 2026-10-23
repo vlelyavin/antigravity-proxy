@@ -1,0 +1,33 @@
+{
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 8317
+  },
+  "apiKey": "none",
+  "upstream": {
+    "egress": {
+      "url": "socks5://127.0.0.1:1055",
+      "accounts": {
+        "lelyaviny@gmail.com": "http://127.0.0.1:21143",
+        "panigatikrishnaiah7@gmail.com": "http://127.0.0.1:21144",
+        "hoveticifo15@gmail.com": "http://127.0.0.1:21146",
+        "amina.gavrilova91@gmail.com": "http://127.0.0.1:21145",
+        "oppo087677110@gmail.com": "http://127.0.0.1:21148",
+        "creolamgmorargdy75@gmail.com": "http://127.0.0.1:21147",
+        "praveeshn24@gmail.com": "http://127.0.0.1:21149"
+      }
+    }
+  },
+  "rotation": {
+    "cooldownMs": 45000,
+    "attemptTimeoutsMs": [
+      25000,
+      25000,
+      20000,
+      20000,
+      15000,
+      15000,
+      15000
+    ]
+  }
+}

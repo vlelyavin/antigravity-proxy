@@ -17,7 +17,32 @@ export const THOUGHT_SIGNATURE_BYPASS = 'skip_thought_signature_validator';
 // keepNull: the response_format path. There the upstream ENFORCES the schema, so a
 // bare collapse turns every nullable field into a required non-null one (the model
 // then invents ids/dates to fill them); the null survives as `nullable: true`.
-// Tool declarations keep the plain collapse — they are not enforced upstream.
+// Tool declarations keep the plain collapse - they are not enforced upstream.
+// JSON-Schema-only keywords (exclusiveMinimum/exclusiveMaximum and friends) are
+// stripped/converted on the tool path: Gemini function declarations reject
+// them with 400 "Unknown name \"exclusiveMinimum\"" (observed live 2026-10-10
+// via opencode vertex-local); inclusive bounds preserve the constraint.
+function sanitizeToolSchema(node) {
+  if (Array.isArray(node)) return node.map(sanitizeToolSchema);
+  if (!node || typeof node !== 'object') return node;
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'exclusiveMinimum' && typeof value === 'number' && (out.minimum === undefined || value > out.minimum)) {
+      out.minimum = value;
+      continue;
+    }
+    if (key === 'exclusiveMaximum' && typeof value === 'number' && (out.maximum === undefined || value < out.maximum)) {
+      out.maximum = value;
+      continue;
+    }
+    if (key === '$schema' || key === '$id' || key === 'additionalProperties' || key === '$defs' || key === '$anchor' || key === '$comment' || key === 'examples') {
+      continue;
+    }
+    out[key] = sanitizeToolSchema(value);
+  }
+  return out;
+}
+
 function normalizeSchemaTypes(node, keepNull = false) {
   if (Array.isArray(node)) return node.map((item) => normalizeSchemaTypes(item, keepNull));
   if (!node || typeof node !== 'object') return node;
@@ -157,11 +182,42 @@ function partsFromContent(content) {
   return [];
 }
 
-const EFFORT_BUDGET = { low: 1000, medium: 4000, high: -1 };
-
-export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort, response_format }, { projectId, sessionId }) {
-  const catalogEntry = findModel(model);
+export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort, reasoning, response_format }, { projectId, sessionId }) {
+  // 2026-10-17 Vova: effort picks the suffixed upstream model; no explicit thinking
+  // budget is sent - Google decides how much to think. off/minimal/low fold onto
+  // low, so "no reasoning" still gets the cheapest thinking model.
+  const effectiveEffort = reasoning_effort ?? reasoning?.effort
+    ?? (reasoning && reasoning.enabled === false ? 'low' : undefined);
+  const effortSuffix = effectiveEffort === 'low' || effectiveEffort === 'none' || effectiveEffort === 'minimal' || effectiveEffort === 'off'
+    ? 'low'
+    : (effectiveEffort === 'high' || effectiveEffort === 'max' || effectiveEffort === 'xhigh' || effectiveEffort === 'ultra'
+      ? 'high'
+      : (effectiveEffort === 'medium' ? 'medium' : null));
+  // An explicit effort overrides a suffix carried by the requested id:
+  // gemini-3.8-flash-low + effort=high resolves to gemini-3.8-flash-high.
+  const baseModel = typeof model === 'string' ? model.replace(/-(low|medium|high)$/, '') : model;
+  const catalogEntry = (effortSuffix && findModel(`${baseModel}-${effortSuffix}`)) || findModel(model);
+  // Gemini 3 takes thinkingLevel (low/medium/high); thinkingBudget is deprecated for
+  // Gemini 3 and can 400 intermittently. No effort -> omit the level (provider default:
+  // medium for 3.8-flash).
+  const effortLevel = effectiveEffort === 'low' || effectiveEffort === 'none' || effectiveEffort === 'minimal' || effectiveEffort === 'off'
+    ? 'low'
+    : (effectiveEffort === 'high' || effectiveEffort === 'max' || effectiveEffort === 'xhigh' || effectiveEffort === 'ultra'
+      ? 'high'
+      : (effectiveEffort === 'medium' ? 'medium' : null));
   const budget = Number.isFinite(max_tokens) ? max_tokens : max_completion_tokens;
+  // Tool replay: Gemini matches functionResponse.name against functionCall.name.
+  // OpenAI clients legitimately omit `name` on tool messages (Hermes sends only
+  // tool_call_id), so resolve it from the preceding assistant tool_calls instead of
+  // falling back to the call id (which the API rejects with 400 INVALID_ARGUMENT).
+  const toolNames = new Map();
+  for (const m of messages ?? []) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const call of m.tool_calls) {
+        if (call?.id && call?.function?.name) toolNames.set(call.id, call.function.name);
+      }
+    }
+  }
   const contents = [];
   let systemText = [];
 
@@ -180,7 +236,7 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
         role: 'user',
         parts: [{
           functionResponse: {
-            name: message.name || message.tool_call_id || 'tool',
+            name: message.name || toolNames.get(message.tool_call_id) || message.tool_call_id || 'tool',
             ...(message.tool_call_id ? { id: message.tool_call_id } : {}),
             response: { result: typeof message.content === 'string' ? message.content : JSON.stringify(message.content) },
           },
@@ -217,14 +273,12 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     generationConfig.maxOutputTokens = Number.isFinite(budget)
       ? budget
       : catalogEntry.maxOutputTokens;
-    // reasoning_effort overrides the model-suffix budget (CPA parity: the Mari
-    // lane pins effort=low on a -high model and expects ~0 reasoning tokens)
-    const effortBudget = reasoning_effort in EFFORT_BUDGET ? EFFORT_BUDGET[reasoning_effort] : null;
-    const thinkingBudget = effortBudget ?? catalogEntry.budget;
-    generationConfig.thinkingConfig = {
-      includeThoughts: thinkingBudget !== 0,
-      thinkingBudget,
-    };
+    // 2026-10-17: pass the reasoning level explicitly (Gemini 3 API field). Google
+    // decides the actual depth; includeThoughts keeps reasoning parts flowing back
+    // to clients as reasoning_content. NEVER send thinkingBudget here: it is
+    // deprecated for Gemini 3 and intermittent 400 INVALID_ARGUMENT comes from it.
+    generationConfig.thinkingConfig = { includeThoughts: true };
+    if (effortLevel) generationConfig.thinkingConfig.thinkingLevel = effortLevel;
   } else {
     if (Number.isFinite(budget)) generationConfig.maxOutputTokens = budget;
   }
@@ -263,7 +317,7 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
         fns.push({
           name: tool.function.name,
           description: tool.function.description || '',
-          parameters: normalizeSchemaTypes(tool.function.parameters || { type: 'object', properties: {} }),
+          parameters: sanitizeToolSchema(normalizeSchemaTypes(tool.function.parameters || { type: 'object', properties: {} })),
         });
       }
     }

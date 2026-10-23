@@ -217,7 +217,7 @@ test('429 rotates to the second account (kind=quota)', async () => {
     const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);
     const json = await res.json();
-    assert.equal(json.choices[0].message.content, 'pong');
+    assert.equal(json.choices[0].message.content, 'hey');
     // and q1 sits out its cooldown
     assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
   } finally {

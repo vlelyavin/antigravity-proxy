@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { openAiToAntigravity } from '../src/rewrite/openai-translate.js';
+
+const mk = (model, extra = {}) => openAiToAntigravity(
+  { model, messages: [{ role: 'user', content: 'hi' }], ...extra },
+  { projectId: 'p', sessionId: 's' },
+);
+
+test('effort picks the suffixed upstream model; no thinking budget is sent', () => {
+  const low = mk('gemini-3.8-flash', { reasoning_effort: 'low' });
+  assert.equal(low.model, 'gemini-3.8-flash-low');
+  assert.equal(low.request.generationConfig.thinkingConfig.thinkingBudget, undefined);
+  assert.equal(low.request.generationConfig.thinkingConfig.includeThoughts, true);
+
+  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'medium' }).model, 'gemini-3.8-flash-medium');
+  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'high' }).model, 'gemini-3.8-flash-high');
+
+  for (const e of ['xhigh', 'ultra', 'max']) {
+    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).model, 'gemini-3.8-flash-high', `effort=${e}`);
+  }
+  for (const e of ['none', 'minimal', 'off']) {
+    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).model, 'gemini-3.8-flash-low', `effort=${e}`);
+  }
+  // owner rule: reasoning disabled behaves like low, not like "no thinking"
+  assert.equal(mk('gemini-3.8-flash', { reasoning: { enabled: false } }).model, 'gemini-3.8-flash-low');
+  // no effort -> catalog default (bare alias -> medium)
+  assert.equal(mk('gemini-3.8-flash').model, 'gemini-3.8-flash-medium');
+});
+
+test('effort overrides the requested suffix; pro alias resolves', () => {
+  assert.equal(mk('gemini-3.8-flash-low', { reasoning_effort: 'high' }).model, 'gemini-3.8-flash-high');
+  assert.equal(mk('gemini-3.1-pro-high').model, 'gemini-pro-agent');
+  assert.equal(mk('gemini-3.1-pro-high', { reasoning_effort: 'low' }).model, 'gemini-3.1-pro-low');
+});
