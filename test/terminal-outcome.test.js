@@ -311,7 +311,8 @@ test('an unsuccessful terminal in the client stream is an error frame, not a cle
   });
   assert.equal(status, 200, 'the client stream was already open');
   assert.match(text, /"content":"partial"/, 'what the caller already received is not retracted');
-  assert.match(text, /unsuccessful finish reason: MALFORMED_FUNCTION_CALL/);
+  assert.match(text, /upstream finished without a successful terminal outcome/);
+  assert.ok(!text.includes('MALFORMED_FUNCTION_CALL'), 'provider terminal values stay out of caller error text');
   assert.match(text, /\[DONE\]/);
   assert.ok(!/"finish_reason":"stop"/.test(text), 'never reported as a completed generation');
   const attempts = events.filter((e) => e.event === 'attempt.timing');

@@ -66,7 +66,9 @@ run of requests keeps gemini's per-account implicit prompt cache warm.
 observed HTTP status, the exact `error.status` enum of a parsed JSON error body, an exact top-level
 OAuth error code, or a local observation (parse failure, egress stage, deadline). messages are never
 inspected - not for `invalid_grant`, not for `quota`. `publicStatus` is separate from
-`observedStatus`; an upstream 401 maps to a caller 502, never to the caller's API-key 401.
+`observedStatus`; upstream 401 and ambiguous 403 map to caller 502, never caller API-key failures.
+An embedded error code is classified separately: HTTP200 carrying `error.code=429` retains
+`observedStatus=200` and maps to public429.
 
 `src/upstream/rotation-policy.js` is pure: failure in, decision out. the matrix:
 
@@ -89,10 +91,16 @@ unknown, protocol and transient failures share one request-local failed-account 
 credentials loaded at request entry the dispatch budget admits at most 2N generation POSTs, 2N OAuth
 POSTs and N project POSTs; one credential gets at most two generation POSTs, shared by the connection
 retry and the forced-auth retry. a caller joining an in-flight refresh records a join, not a POST.
-the request deadline always wins.
+the request deadline always wins. a transport reset before response headers may already have reached
+the provider; a connection retry is another potentially metered POST, never proof of nondelivery.
+observed HTTP errors are handled by policy and never enter the connection retry.
 
 an expired restriction admits exactly one real bounded attempt as a recovery probe. the lease is
 held from selection through the attempt and released on success, failure, cancellation and timeout.
+resource identity learned during preparation acquires the same exclusive probe lease. newer evidence
+blocks an older probe before dispatch; the final production check and dispatch do not yield between them.
+a shared egress can recover through any credential using that exit; its recovery is independent of
+the credential generation that first observed the failure.
 a successful probe clears only restriction records whose evidence revision has not moved; a late
 success cannot erase a newer cooldown, and a late failure for an old generation is skipped after the
 handler re-reads the credential material. expiry or release without success is not recovery.
@@ -105,8 +113,10 @@ pool exhaustion is typed. 429 is returned only when proven quota evidence explai
 all-blocked credentials and egress gates answer 503, mixed/unknown histories answer an explicit 503
 or the last real failure. `Retry-After` comes only from a recorded eligibility time or a real
 upstream header. the model/account/project/provider quota vocabulary is intentionally inactive: no
-genuine AGY scoped quota metadata was established, so the proven-evidence allowlist is empty and a
-fixture with convenient fields cannot activate it.
+genuine AGY scoped quota metadata was established, so no adapter writes account/model/project/provider
+quota restrictions. the scope vocabulary alone cannot activate shared state; a reviewed schema and
+identity mapping are required before adding such an adapter. `rotation.cooldownMs` is retained as a
+legacy configuration field and is unused by the initial adapter.
 
 ## why the daily host
 
@@ -153,10 +163,13 @@ the antigravity IDE and CLIProxyAPI actually use) accepts the same shape with
   again. normal refresh increments a token version but not the generation.
 - shared refresh singleflight is keyed by account+generation. a stale finally
   cannot delete a newer entry, and a late old-generation result cannot replace
-  a newer cached token.
+  a newer cached token. cache write ordering uses monotonic operation versions, including when
+  refreshes complete within the same millisecond. a same-path replacement detected during preparation
+  reloads that credential snapshot once without adding credentials or resetting dispatch budgets.
 - only an exact top-level `error: "invalid_grant"` from the token endpoint is
   revocation. network, 429, 5xx and malformed token responses keep their own
-  transient class and never block the credential.
+  transient class and never block the credential. malformed success-token/expiry shapes are rejected;
+  a structured CONNECT/dial failure during refresh retains its egress scope.
 
 ## project id
 

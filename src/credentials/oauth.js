@@ -54,7 +54,10 @@ export async function refreshAccessToken(refreshToken, { fetchImpl = globalThis.
   }
   let json = null;
   try { json = await response.json(); } catch { json = null; }
-  if (!response.ok || !json?.access_token) {
+  const validToken = typeof json?.access_token === 'string' && json.access_token.trim() !== '';
+  const validExpiry = json?.expires_in === undefined
+    || (Number.isFinite(json.expires_in) && json.expires_in > 0);
+  if (!response.ok || !validToken || !validExpiry) {
     const code = oauthErrorCode(json);
     const error = new Error('oauth token endpoint rejected the refresh');
     error.observedStatus = Number.isInteger(response.status) ? response.status : null;
@@ -67,7 +70,7 @@ export async function refreshAccessToken(refreshToken, { fetchImpl = globalThis.
       // The endpoint's own failure class wins over a body that is not JSON.
       error.reason = 'oauth_unavailable';
       error.evidence = json === null ? 'oauth_network' : 'oauth_http_status';
-    } else if (json === null) {
+    } else if (json === null || response.ok) {
       error.reason = 'oauth_malformed';
       error.evidence = 'oauth_malformed_response';
     } else {

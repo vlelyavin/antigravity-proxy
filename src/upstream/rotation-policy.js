@@ -4,7 +4,7 @@
 // rate limit with UNKNOWN owner: it may rotate to another account inside this request and it may
 // not write shared account/model state. Broad account/model/project/provider quota remains
 // contract vocabulary only: no genuine AGY quota metadata was established, so the scoped branch is
-// guarded by an empty evidence allowlist and cannot be activated by a convenient fixture.
+// inactive until a separately reviewed adapter exists; a fixture cannot activate it.
 import { POLICY_VERSION } from './failure.js';
 
 /** Unknown/protocol/transient failures share this one request-local failed-account budget. */
@@ -13,21 +13,12 @@ export const SHARED_FAILURE_BUDGET = 2;
 /** Locally proven egress failure gates that egress only, for one short local window. */
 export const EGRESS_COOLDOWN_MS = 30_000;
 
-/** Frozen and intentionally empty until a reviewed AGY quota schema/identity mapping exists. */
-export const PROVEN_SCOPED_QUOTA_EVIDENCE = Object.freeze([]);
-
-const SCOPED_QUOTA_SCOPES = new Set(['account', 'account_model', 'project', 'provider']);
 const SHARED_BUDGET_REASONS = new Set([
   'rate_limit_unknown_scope', 'endpoint_unavailable', 'unknown', 'timeout', 'permission_denied',
   'model_unavailable', 'truncated', 'malformed', 'empty_response', 'unsuccessful_terminal',
   'oauth_unavailable', 'oauth_rejected', 'oauth_malformed',
+  'account_restricted', 'project_restricted', 'provider_unavailable',
 ]);
-
-export function isProvenScopedQuota(failure) {
-  return failure?.reason === 'scoped_quota'
-    && SCOPED_QUOTA_SCOPES.has(failure.scope)
-    && PROVEN_SCOPED_QUOTA_EVIDENCE.includes(failure.evidence);
-}
 
 function decision(failure, fields) {
   return {
@@ -112,7 +103,7 @@ export function decideFailure(failure, context = {}) {
         });
       } else {
         out = decision(failure, {
-          reason: 'auth_rejected_after_refresh',
+          reason: authRetryUsed ? 'auth_rejected_after_refresh' : 'auth_rejected',
           action: 'alternate',
           outcome: 'auth',
           headerReason: 'auth',
@@ -128,34 +119,10 @@ export function decideFailure(failure, context = {}) {
       out = decision(failure, { action: 'alternate', outcome: 'rate_limited', headerReason: 'quota' });
       break;
     case 'scoped_quota':
-      if (isProvenScopedQuota(failure)) {
-        out = decision(failure, {
-          action: 'alternate',
-          sharedEffect: 'cool_scoped',
-          sharedScope: failure.scope,
-          outcome: 'quota',
-          headerReason: 'quota',
-        });
-      } else {
-        // Contract vocabulary without reviewed evidence: never activate a wider state.
-        out = decision(failure, {
-          reason: 'rate_limit_unknown_scope',
-          scope: 'request',
-          action: 'alternate',
-          outcome: 'rate_limited',
-          headerReason: 'quota',
-        });
-      }
-      break;
-    case 'account_restricted':
-    case 'project_restricted':
-    case 'provider_unavailable':
+      // No AGY adapter recognizes scoped quota yet; vocabulary alone is not evidence.
       out = decision(failure, {
-        action: 'alternate',
-        sharedEffect: 'cool_scoped',
-        sharedScope: failure.scope,
-        outcome: 'quota',
-        headerReason: 'quota',
+        reason: 'rate_limit_unknown_scope', scope: 'request', action: 'alternate',
+        outcome: 'rate_limited', headerReason: 'quota',
       });
       break;
     case 'egress_invalid_config':

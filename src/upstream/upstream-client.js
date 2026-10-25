@@ -1,4 +1,5 @@
 import path from 'node:path';
+import https from 'node:https';
 import { createHash } from 'node:crypto';
 import { newSessionId } from '../credentials/oauth.js';
 import { materialGeneration } from '../credentials/credential-store.js';
@@ -145,6 +146,7 @@ export class UpstreamClient {
     // "<accountId>\0<generation>" -> in-flight refresh promise
     this.refreshing = new Map();
     this.tokenVersion = 0;
+    this.projectVersion = 0;
   }
 
   agentFor(egressUrl) {
@@ -209,9 +211,6 @@ export class UpstreamClient {
       return globalThis.fetch(url, { method, headers, body, signal });
     }
     // node:https path (egress configured)
-    const { default: https_ } = await import('node:https');
-    // the dynamic import yields the event loop: the caller may have hung up while it was pending
-    if (signal?.aborted) throw abortFailure(signal);
     const target = new URL(url);
     const payload = body ?? null;
     return new Promise((resolve, reject) => {
@@ -253,7 +252,7 @@ export class UpstreamClient {
         response.on('error', onReadError);
         signal?.addEventListener('abort', onReadAbort, { once: true });
       });
-      request = https_.request({
+      request = https.request({
         hostname: target.hostname,
         port: target.port || 443,
         path: `${target.pathname}${target.search}`,
@@ -329,7 +328,7 @@ export class UpstreamClient {
         evidence: 'dispatch_budget', publicStatus: 503, accountId: account.id, generation,
       });
     }
-    const refreshStartedAt = Date.now();
+    const refreshVersion = ++this.tokenVersion;
     const promise = (async () => {
       const { refreshAccessToken } = await import('../credentials/oauth.js');
       try {
@@ -343,12 +342,11 @@ export class UpstreamClient {
             evidence: 'credential_generation', publicStatus: 502, accountId: account.id, generation,
           });
         }
-        this.tokenVersion += 1;
         const current = this.tokens.get(account.id);
         // A late old-generation result must not replace a token written by newer material.
-        if (current && current.generation !== generation && current.cachedAt > refreshStartedAt) {
+        if (current && current.generation !== generation && current.version > refreshVersion) {
           this.logger.info('oauth.stale_result_discarded', {
-            account: accountLabel(account), tokenVersion: this.tokenVersion,
+            account: accountLabel(account), tokenVersion: refreshVersion,
           });
           return accessToken;
         }
@@ -356,13 +354,17 @@ export class UpstreamClient {
           token: accessToken,
           expiresAt: Date.now() + expiresIn * 1000,
           generation,
-          version: this.tokenVersion,
-          cachedAt: Date.now(),
+          version: refreshVersion,
         });
-        this.logger.info('oauth.refreshed', { account: accountLabel(account), expiresIn, tokenVersion: this.tokenVersion });
+        this.logger.info('oauth.refreshed', { account: accountLabel(account), expiresIn, tokenVersion: refreshVersion });
         return accessToken;
       } catch (error) {
         if (error instanceof UpstreamError) throw error;
+        const egressError = error?.name === 'EgressError' ? error : error?.cause;
+        if (egressError?.name === 'EgressError') {
+          const egress = this.egressIdentityFor(account);
+          throw egressFailure(egressError, { accountId: account.id, generation, egressKey: egress.key, egressAlias: egress.alias });
+        }
         throw oauthFailure(error, account, generation);
       }
     })();
@@ -423,6 +425,7 @@ export class UpstreamClient {
         evidence: 'dispatch_budget', publicStatus: 503, accountId: account.id, generation,
       });
     }
+    const projectVersion = ++this.projectVersion;
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:loadCodeAssist`;
     const body = JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } });
     const headers = {
@@ -457,8 +460,11 @@ export class UpstreamClient {
         evidence: 'project_response', publicStatus: 502, accountId: account.id, generation,
       });
     }
-    account.projectId = project;
-    this.projects.set(account.id, { projectId: project, generation });
+    const current = this.projects.get(account.id);
+    if (generationOf(account) === generation && !(current && current.version > projectVersion)) {
+      account.projectId = project;
+      this.projects.set(account.id, { projectId: project, generation, version: projectVersion });
+    }
     // the project id itself stays out of the journal
     this.logger.info('project.resolved', { account: accountLabel(account) });
     return project;
@@ -541,7 +547,10 @@ export class UpstreamClient {
       // Immediately before the wire: the caller may be gone, the credential may have been replaced,
       // a resolved resource gate may now apply, or this recovery probe may have lost its lease.
       if (signal?.aborted) throw abortFailure(signal);
-      if (beforeDispatch) await beforeDispatch(meta);
+      if (beforeDispatch) {
+        const check = beforeDispatch(meta);
+        if (check?.then) await check;
+      }
       if (signal?.aborted) throw abortFailure(signal);
       if (budget && !budget.takeGeneration(account.id)) {
         throw new UpstreamError('generation dispatch budget exhausted', {
@@ -552,10 +561,10 @@ export class UpstreamClient {
       return this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
     };
 
-    // Only a pre-flight transport failure is retried once. A response, an auth/protocol decision
-    // or a budget stop is never blind-re-POSTed.
-    const PREFLIGHT_RETRYABLE = new Set(['timeout', 'egress_unavailable', 'egress_refused', 'unknown']);
-    let preflightFailure = null;
+    // A transport failure may have reached the provider: its one retry is another metered POST.
+    // Observed HTTP responses and policy/budget stops never enter this connection retry.
+    const CONNECTION_RETRYABLE = new Set(['timeout', 'egress_unavailable', 'egress_refused', 'unknown']);
+    let transportFailure = null;
     try {
       const response = await dispatch();
       if (response.ok) return response;
@@ -563,20 +572,20 @@ export class UpstreamClient {
       throw upstreamErrorFrom(response.status, text, account.id, response.headers, { generation: meta.generation });
     } catch (error) {
       if (error instanceof UpstreamError) {
-        if (!PREFLIGHT_RETRYABLE.has(error.reason)) throw error;
-        preflightFailure = error;
+        if (error.observedStatus !== null || !CONNECTION_RETRYABLE.has(error.reason)) throw error;
+        transportFailure = error;
       } else {
         if (signal?.aborted) throw abortFailure(signal);
         const classified = classifyThrown(error);
         if (!(classified instanceof UpstreamError)) throw classified;
-        if (!PREFLIGHT_RETRYABLE.has(classified.reason)) throw classified;
-        preflightFailure = classified;
+        if (!CONNECTION_RETRYABLE.has(classified.reason)) throw classified;
+        transportFailure = classified;
       }
     }
     // the caller may have hung up while the first attempt was failing: do not re-POST for nobody
     if (signal?.aborted) throw abortFailure(signal);
-    if (budget && !budget.canTakeGeneration(account.id)) throw preflightFailure;
-    // single pre-flight retry, on a fresh connection: the failed attempt most likely took a dead
+    if (budget && !budget.canTakeGeneration(account.id)) throw transportFailure;
+    // single transport retry, on a fresh connection: the failed attempt most likely took a dead
     // pooled socket, and the pool can hold more of them (23.09 03:43: the retry hit one too)
     for (const agent of this.agents.values()) dropIdleSockets(agent);
     try {

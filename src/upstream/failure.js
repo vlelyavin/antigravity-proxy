@@ -158,11 +158,6 @@ export function journalModel(value) {
   return hit ? hit.id : null;
 }
 
-/** A provider finish reason is only echoed when it has the fixed enum shape. */
-export function safeFinishReason(value) {
-  return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(value) ? value : 'invalid';
-}
-
 /** Retry-After (delta seconds or HTTP date) -> epoch ms; no cap and no inference. */
 export function parseRetryAfter(value, now = Date.now()) {
   if (typeof value !== 'string' || value.trim() === '') return null;
@@ -272,6 +267,8 @@ export function publicFailureText(reason) {
       return 'upstream response was malformed';
     case 'empty_response':
       return 'upstream returned no usable response';
+    case 'unsuccessful_terminal':
+      return 'upstream finished without a successful terminal outcome';
     case 'egress_invalid_config':
       return 'configured egress is invalid';
     case 'egress_unavailable':
@@ -319,7 +316,6 @@ export class UpstreamError extends Error {
     this.projectId = options.projectId ?? null;
     this.kind = oneOf(options.kind, new Set(['auth', 'quota', 'timeout', 'truncated', 'terminal', 'malformed', 'egress', 'deadline', 'client_abort', 'budget', 'invalid_request', 'other']), legacyKind(this.reason));
     this.reported = options.reported === true;
-    this.publicMessage = null;
   }
 }
 
@@ -417,7 +413,7 @@ export function describeFailure(error) {
   };
 }
 
-function classifyHttp(status, text, accountId, headers, { embedded = false, structuredStatus = null, generation = null } = {}) {
+function classifyHttp(status, text, accountId, headers, { embedded = false, structuredStatus = null, generation = null, observedStatus = status } = {}) {
   const structured = structuredStatus ?? structuredErrorStatus(text);
   const picked = httpReason(status, structured);
   let evidence = picked.evidence;
@@ -432,7 +428,7 @@ function classifyHttp(status, text, accountId, headers, { embedded = false, stru
     reason: picked.reason,
     scope: 'request',
     evidence,
-    observedStatus: Number.isInteger(status) ? status : null,
+    observedStatus: Number.isInteger(observedStatus) ? observedStatus : null,
     publicStatus,
     retryable: picked.reason === 'rate_limit_unknown_scope' || picked.reason === 'endpoint_unavailable' || picked.reason === 'unknown',
     retryAt,
@@ -451,7 +447,7 @@ export function upstreamErrorFrom(status, text, accountId = null, headers = null
 }
 
 /** An explicit SSE/JSON error object (bare or wrapped by the caller) -> structured failure. */
-export function upstreamErrorFromJson(error, accountId = null, { generation = null } = {}) {
+export function upstreamErrorFromJson(error, accountId = null, { generation = null, observedStatus = null } = {}) {
   const code = Number.isInteger(error?.code) ? error.code : null;
   const statusName = typeof error?.status === 'string' ? error.status : null;
   const pseudo = code ?? (statusName === 'RESOURCE_EXHAUSTED' ? 429
@@ -460,15 +456,13 @@ export function upstreamErrorFromJson(error, accountId = null, { generation = nu
         : statusName === 'INVALID_ARGUMENT' ? 400
           : statusName === 'NOT_FOUND' ? 404
             : 502);
-  return classifyHttp(pseudo, null, accountId, null, { embedded: true, structuredStatus: statusName, generation });
+  return classifyHttp(pseudo, null, accountId, null, { embedded: true, structuredStatus: statusName, generation, observedStatus });
 }
 
 /** The caller-facing message: a fixed reason text plus the correlation reference. */
 export function safeClientMessage(error, requestId) {
   const failure = describeFailure(error);
-  const text = error instanceof UpstreamError && typeof error.publicMessage === 'string'
-    ? error.publicMessage
-    : publicFailureText(failure.reason);
+  const text = publicFailureText(failure.reason);
   return requestId ? `${text} (ref ${requestId})` : text;
 }
 

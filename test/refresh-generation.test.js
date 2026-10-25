@@ -331,3 +331,65 @@ test('a local timeout code is a timeout; a bare message is not evidence of one',
     (error) => error instanceof UpstreamError && error.reason === 'timeout',
   );
 });
+
+
+test('same-millisecond refresh completion cannot let g1 overwrite g2', async (t) => {
+  t.mock.method(Date, 'now', () => 1_000_000);
+  const upstream = client();
+  const first = deferred();
+  const second = deferred();
+  const p1 = upstream.accessToken(account('g1'), { fetchImpl: () => first.promise });
+  const p2 = upstream.accessToken(account('g2'), { fetchImpl: () => second.promise });
+  await new Promise((resolve) => setImmediate(resolve));
+  second.resolve(tokenResponse('token-g2'));
+  await p2;
+  first.resolve(tokenResponse('token-g1'));
+  await p1;
+  assert.equal(upstream.tokens.get('/creds/a.json').token, 'token-g2');
+});
+
+test('late project resolution does not overwrite the newer generation project cache', async () => {
+  const upstream = client();
+  upstream.accessToken = async () => 'token';
+  const first = deferred();
+  let calls = 0;
+  upstream.request = async () => (++calls === 1 ? first.promise : { ok: true, json: async () => ({ project: 'project-g2' }) });
+  const p1 = upstream.ensureProject({ id: '/creds/a.json', generation: 'g1' });
+  await new Promise((resolve) => setImmediate(resolve));
+  await upstream.ensureProject({ id: '/creds/a.json', generation: 'g2' });
+  first.resolve({ ok: true, json: async () => ({ project: 'project-g1' }) });
+  await p1;
+  assert.equal(upstream.projects.get('/creds/a.json').projectId, 'project-g2');
+});
+
+test('an observed unknown HTTP rejection is not retried as a connection failure', async () => {
+  const upstream = client();
+  upstream.accessToken = async () => 'token';
+  let calls = 0;
+  upstream.request = async () => { calls += 1; return { ok: false, status: 418, text: async () => '' }; };
+  await assert.rejects(upstream.generate({
+    openAiBody: { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'synthetic' }] },
+    account: account('g1'), budget: createDispatchBudget({ credentials: 1 }),
+  }), (error) => error.observedStatus === 418);
+  assert.equal(calls, 1);
+});
+
+test('a synchronous dispatch check and the wire share one event-loop turn', async () => {
+  const upstream = client();
+  upstream.accessToken = async () => 'token';
+  let valid = true;
+  upstream.request = async () => { assert.equal(valid, true); return { ok: true, status: 200 }; };
+  await upstream.generate({
+    openAiBody: { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'synthetic' }] },
+    account: account('g1'),
+    beforeDispatch: () => { assert.equal(valid, true); queueMicrotask(() => { valid = false; }); },
+  });
+});
+
+
+test('an OAuth CONNECT failure keeps its proven egress scope', async () => {
+  const upstream = client({ upstream: { ...CONFIG.upstream, egress: { url: 'http://user:pass@proxy.example:1080' } } });
+  await assert.rejects(upstream.accessToken(account('g1'), {
+    fetchImpl: async () => { throw new EgressError('synthetic', { stage: 'connect', reason: 'egress_refused' }); },
+  }), (error) => error.reason === 'egress_refused' && error.origin === 'egress' && error.egressKey === upstream.egressFor(account('g1')));
+});

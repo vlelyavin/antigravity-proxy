@@ -68,6 +68,10 @@ export class AccountPool {
   /** Every restriction key that the given attempt context would have to satisfy. */
   #keysFor(account, ctx = {}) {
     const out = [{
+      key: restrictionKey('provider', { resourceKey: 'agy' }),
+      scope: 'provider',
+      resourceAlias: 'agy',
+    }, {
       key: restrictionKey('account', { accountId: account.id }),
       scope: 'account',
       resourceAlias: accountLabel(account),
@@ -203,17 +207,28 @@ export class AccountPool {
 
   /**
    * Re-check after asynchronous preparation and immediately before dispatch. Expired restrictions
-   * are probe candidates, not active gates; only a still-active restriction (or a current-generation
-   * credential block) stops the dispatch. This is how a resolved project identity is matched against
-   * a resource gate that selection could not see yet.
+   * require an exclusive probe lease; newer evidence supersedes the selected probe revision.
+   * A current-generation credential block also stops dispatch. Resolved project identity is matched
+   * against gates that selection could not see yet.
    */
   gateFor(account, ctx = {}, selection = null) {
-    const owned = new Set(selection?.probes?.map((probe) => probe.key) ?? []);
     for (const entry of this.#keysFor(account, ctx)) {
-      if (owned.has(entry.key)) continue;
       const record = this.restrictions.get(entry.key);
       if (!record) continue;
-      if (record.until !== null && record.until <= this.now()) continue; // expired: probe-eligible
+      const owned = selection?.probes?.find((probe) => probe.key === entry.key);
+      if (owned?.revision === record.revision
+        && this.probes.get(entry.key)?.owner === selection.probeToken) continue;
+      if (!owned && selection && !this.probes.has(entry.key)
+        && record.until !== null && record.until <= this.now()) {
+        // A resource learned during preparation needs the same exclusive lease as selection.
+        selection.probeToken ??= Symbol('probe');
+        this.probes.set(entry.key, {
+          owner: selection.probeToken, revision: record.revision, alias: entry.resourceAlias,
+          scope: entry.scope, account: selection.alias,
+        });
+        selection.probes.push({ key: entry.key, revision: record.revision, scope: entry.scope, resourceAlias: entry.resourceAlias });
+        continue;
+      }
       return {
         scope: entry.scope,
         resource: entry.resourceAlias,
@@ -259,7 +274,8 @@ export class AccountPool {
       const record = this.restrictions.get(probe.key);
       if (!record) { this.probes.delete(probe.key); continue; }
       if (record.revision !== probe.revision) continue; // newer evidence wins
-      if (ctx.generation != null && record.generation != null && record.generation !== ctx.generation) continue;
+      if ((record.scope === 'account' || record.scope === 'account_model')
+        && ctx.generation != null && record.generation != null && record.generation !== ctx.generation) continue;
       this.restrictions.delete(probe.key);
       this.probes.delete(probe.key);
       recovered.push({ scope: record.scope, resource: record.resourceAlias });

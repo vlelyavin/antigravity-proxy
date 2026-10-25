@@ -7,11 +7,10 @@ import {
   upstreamErrorFrom,
   upstreamErrorFromJson,
 } from '../src/upstream/upstream-client.js';
-import { describeFailure, journalModel, parseRetryAfter, safeFinishReason } from '../src/upstream/failure.js';
+import { describeFailure, journalModel, parseRetryAfter } from '../src/upstream/failure.js';
 import {
   SHARED_FAILURE_BUDGET,
   decideFailure,
-  isProvenScopedQuota,
 } from '../src/upstream/rotation-policy.js';
 import { oauthErrorCode, refreshAccessToken } from '../src/credentials/oauth.js';
 
@@ -61,7 +60,6 @@ test('a fixture with convenient quota fields does not activate a wider scope', (
   assert.equal(failure.scope, 'request');
   assert.equal(failure.model, null);
   assert.equal(failure.projectId, null);
-  assert.equal(isProvenScopedQuota(failure), false);
   const decision = decideFailure(failure, {});
   assert.equal(decision.sharedEffect, 'none');
   assert.equal(decision.sharedScope, null);
@@ -165,6 +163,9 @@ test('policy: exact revocation blocks a generation; a second 401 only avoids it 
   assert.equal(second.reason, 'auth_rejected_after_refresh');
   assert.equal(second.sharedEffect, 'none', 'a repeated 401 is not a revoked credential');
   assert.equal(second.budget, 'none');
+  const spent = decideFailure(first401, { canRetryCredential: false });
+  assert.equal(spent.reason, 'auth_rejected', 'dispatch exhaustion does not mean a refresh happened');
+  assert.equal(spent.stopReason, 'credential_dispatch_budget');
 });
 
 test('policy: client cancellation and the request deadline outrank every penalty', () => {
@@ -210,13 +211,38 @@ test('policy: proven egress failures gate that egress, invalid config gates it p
   assert.equal(decideFailure(invalid, {}).sharedEffect, 'cool_egress');
 });
 
-test('journal helpers keep model and finish-reason fields inside their allowlists', () => {
+test('journal helpers keep model fields inside their allowlists', () => {
   assert.equal(journalModel('gemini-3.8-flash-high'), 'gemini-3.8-flash-high');
   assert.equal(journalModel('google/gemini-3.8-flash-high'), 'gemini-3.8-flash-high');
   assert.equal(journalModel('gemini-pro-agent'), 'gemini-3.1-pro-high');
   assert.equal(journalModel('SENTINEL_ARBITRARY_MODEL_TEXT'), null);
-  assert.equal(safeFinishReason('MALFORMED_FUNCTION_CALL'), 'MALFORMED_FUNCTION_CALL');
-  assert.equal(safeFinishReason('sneaky payload with spaces'), 'invalid');
   const failure = describeFailure(upstreamErrorFrom(502, 'SENTINEL_BODY', 'a'));
   assert.equal(JSON.stringify(failure).includes('SENTINEL_BODY'), false, 'the classifier never copies a body');
+});
+
+
+test('unsupported broad restriction vocabulary cannot activate shared state', () => {
+  for (const reason of ['account_restricted', 'project_restricted', 'provider_unavailable']) {
+    const decision = decideFailure(new UpstreamError('synthetic', {
+      reason, scope: 'provider', evidence: 'pool_gate', publicStatus: 502,
+    }));
+    assert.equal(decision.sharedEffect, 'none', reason);
+    assert.equal(decision.budget, 'shared', reason);
+  }
+});
+
+test('a successful OAuth response still validates token and expiry shapes', async () => {
+  for (const json of [{}, { access_token: {} }, { access_token: 't', expires_in: 'bad' }, { access_token: 't', expires_in: -1 }]) {
+    await assert.rejects(refreshAccessToken('synthetic', {
+      fetchImpl: async () => ({ ok: true, status: 200, json: async () => json }),
+    }), (error) => error.reason === 'oauth_malformed');
+  }
+});
+
+
+test('embedded error codes do not replace the observed HTTP status', () => {
+  const failure = upstreamErrorFromJson({ code: 429, status: 'RESOURCE_EXHAUSTED' }, 'a', { observedStatus: 200 });
+  assert.equal(failure.observedStatus, 200);
+  assert.equal(failure.publicStatus, 429);
+  assert.equal(failure.reason, 'rate_limit_unknown_scope');
 });

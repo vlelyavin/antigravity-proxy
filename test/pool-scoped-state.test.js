@@ -241,3 +241,47 @@ test('the coarse healthy() view ignores egress/project gates it cannot attribute
   });
   assert.deepEqual(pool.healthy(accounts).map((a) => a.id), ['/creds/b.json'], 'selection, not healthy(), applies egress');
 });
+
+
+test('a probe cannot dispatch after newer evidence restricts its scope again', () => {
+  const { pool, accounts, advance, now, contextFor } = setup();
+  pool.restrict({ account: accounts[0], scope: 'account', until: now() + 1 });
+  advance(2);
+  const selection = pool.select(accounts, { context: contextFor });
+  pool.restrict({ account: accounts[0], scope: 'account', until: now() + 60_000 });
+  assert.ok(pool.gateFor(selection.account, selection.context, selection));
+});
+
+test('an expired project learned during preparation still admits only one probe', () => {
+  const { pool, accounts, advance, now } = setup();
+  pool.restrict({ scope: 'project', projectId: 'late', until: now() + 1 });
+  advance(2);
+  const first = pool.select(accounts, { context: (a) => ({ generation: a.generation }) });
+  const second = pool.select(accounts, { context: (a) => ({ generation: a.generation }) });
+  assert.equal(pool.gateFor(first.account, { ...first.context, projectId: 'late' }, first), null);
+  assert.ok(pool.gateFor(second.account, { ...second.context, projectId: 'late' }, second));
+  pool.releaseProbe(first);
+  assert.equal(pool.gateFor(second.account, { ...second.context, projectId: 'late' }, second), null);
+  pool.releaseProbe(second);
+  assert.equal(pool.snapshot().activeProbes.length, 0);
+});
+
+test('the pool applies its provider gate to every AGY account', () => {
+  const { pool, accounts, now, contextFor } = setup();
+  pool.restrict({ scope: 'provider', provider: 'agy', until: now() + 60_000 });
+  const selection = pool.select(accounts, { context: contextFor });
+  assert.equal(selection.account, null);
+  assert.equal(selection.counts.resourceGated, accounts.length);
+});
+
+
+test('a shared egress recovers when a different credential completes its probe', () => {
+  const { pool, accounts, now, advance } = setup();
+  const context = (account) => ({ generation: account.generation, egressKey: 'same-exit', egressAlias: 'egress-test' });
+  pool.restrict({ account: accounts[0], generation: 'ga', scope: 'egress', egressKey: 'same-exit', until: now() + 1 });
+  advance(2);
+  const selection = pool.select(accounts, { tried: new Set([accounts[0].id]), context });
+  assert.equal(selection.account.id, accounts[1].id);
+  assert.equal(pool.recoverProbe(selection, { generation: 'gb' }).length, 1);
+  assert.equal(pool.snapshot().restrictions.length, 0);
+});

@@ -114,7 +114,7 @@ async function startStack({
   const client = givenClient ?? new UpstreamClient({ config, logger });
   if (!givenClient) client.accessToken = accessToken ?? (async (account) => tokenFor(account));
   const pool = new AccountPool({ logger });
-  const store = { readAll: () => accounts };
+  const store = { readAll: () => accounts.map((account) => ({ ...account })) };
   const server = createServer({ config, credentialStore: store, upstream: client, pool, logger });
   await once(server.listen(0, '127.0.0.1'), 'listening');
   const close = () => {
@@ -402,6 +402,7 @@ test('the native generateContent lane rejects embedded errors and missing termin
     const embedded = await nativeGenerate(stack.port);
     assert.equal(embedded.status, 429, 'an embedded quota error is not a fabricated 200');
     assert.equal(embedded.headers.get('x-agy-reason'), 'quota');
+    assert.equal(stack.events.find((event) => event.event === 'attempt.timing').observedStatus, 200);
 
     mode = 'noTerminal';
     const missing = await nativeGenerate(stack.port);
@@ -839,4 +840,35 @@ test('a local request-shape rejection is a caller 400, never an upstream failure
   } finally {
     stack.close();
   }
+});
+
+
+test('committed SSE errors never echo arbitrary uppercase terminal values', async () => {
+  const stack = await startStack({
+    accounts: [{ id: '/creds/a.json', generation: 'ga', projectId: 'p' }],
+    responder: () => ({ sse: [{ response: { candidates: [{ finishReason: 'SENTINEL_PRIVATE_TERMINAL' }] } }] }),
+  });
+  try {
+    const response = await chat(stack.port, { model: 'gemini-3.8-flash-high', stream: true, messages: [{ role: 'user', content: 'synthetic' }] });
+    assert.equal(response.text.includes('SENTINEL_PRIVATE_TERMINAL'), false);
+  } finally { stack.close(); }
+});
+
+test('material replacement during preparation retries the actual new credential snapshot', async () => {
+  const accounts = [{ id: '/creds/a.json', generation: 'g1', projectId: 'p', refreshToken: 'r1' }];
+  let calls = 0;
+  const stack = await startStack({
+    accounts,
+    accessToken: async (account) => {
+      if (++calls === 1) accounts.splice(0, 1, { ...account, generation: 'g2', refreshToken: 'r2' });
+      return tokenFor(account, account.generation);
+    },
+    responder: () => ({ sse: STREAM_OK }),
+  });
+  try {
+    const response = await chat(stack.port, { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'synthetic' }] });
+    assert.equal(response.status, 200);
+    assert.equal(stack.calls.length, 1);
+    assert.ok(stack.calls[0].token.endsWith('|g2'));
+  } finally { stack.close(); }
 });

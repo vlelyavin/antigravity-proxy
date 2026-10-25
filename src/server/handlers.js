@@ -10,8 +10,7 @@ import {
   describeFailure,
   failureFields,
   journalModel,
-  publicFailureText,
-  safeFinishReason,
+  safeClientMessage,
 } from '../upstream/failure.js';
 import {
   EGRESS_COOLDOWN_MS,
@@ -222,9 +221,9 @@ function explicitUpstreamError(payload) {
   return payload?.error || payload?.response?.error || null;
 }
 
-function unsuccessfulTerminal(accountId, finishReason, generation) {
+function unsuccessfulTerminal(accountId, generation) {
   return new UpstreamError(
-    `upstream finished with an unsuccessful finish reason: ${safeFinishReason(finishReason)}`,
+    'upstream finished without a successful terminal outcome',
     {
       status: 502, origin: 'protocol', phase: 'stream', reason: 'unsuccessful_terminal',
       scope: 'request', evidence: 'unsuccessful_terminal', publicStatus: 502,
@@ -330,7 +329,7 @@ export function createFlowWatchdog({ firstMeaningfulFrameMs, idleMs, onStall }) 
 }
 
 
-function applySharedEffect(pool, decision, { account, generation, context, config, now }) {
+function applySharedEffect(pool, decision, { account, generation, context, now }) {
   if (decision.sharedEffect === 'block_credential') {
     return pool.blockGeneration({
       account, generation, reason: decision.reason, evidence: decision.evidence,
@@ -344,20 +343,6 @@ function applySharedEffect(pool, decision, { account, generation, context, confi
       egressKey: context.egressKey,
       egressAlias: context.egressAlias,
       until: decision.reason === 'egress_invalid_config' ? null : now + EGRESS_COOLDOWN_MS,
-      reason: decision.reason,
-      evidence: decision.evidence,
-      generation,
-    });
-  }
-  if (decision.sharedEffect === 'cool_scoped') {
-    const until = decision.retryAt ?? now + (config?.rotation?.cooldownMs ?? 60_000);
-    return pool.restrict({
-      account,
-      scope: decision.sharedScope,
-      model: decision.sharedScope === 'account_model' ? context?.model ?? null : null,
-      projectId: decision.sharedScope === 'project' ? context?.projectId ?? null : null,
-      provider: decision.sharedScope === 'provider' ? 'agy' : null,
-      until,
       reason: decision.reason,
       evidence: decision.evidence,
       generation,
@@ -409,7 +394,7 @@ export async function handleWithRotation({
     try {
       const fresh = store.readAll();
       const hit = fresh.find((account) => account.id === accountId);
-      return hit ? { known: true, generation: generationOf(hit) } : { known: true, generation: null };
+      return hit ? { known: true, generation: generationOf(hit), account: hit } : { known: true, generation: null };
     } catch {
       return { known: false, generation: null };
     }
@@ -517,7 +502,7 @@ export async function handleWithRotation({
         policyVersion: POLICY_VERSION,
       });
 
-      const beforeDispatch = async (meta) => {
+      const beforeDispatch = (meta) => {
         if (clientGone()) throw clientAbortError();
         if (outOfTime()) throw deadlineError(deadlineMs);
         if (meta.outboundModel) ctx.setOutboundModel(meta.outboundModel);
@@ -605,7 +590,7 @@ export async function handleWithRotation({
           if (decision.sharedEffect !== 'none') {
             stateEffect = generationCurrent
               ? applySharedEffect(pool, decision, {
-                account, generation: attemptGeneration, context: attemptContext, config, now: Date.now(),
+                account, generation: attemptGeneration, context: attemptContext, now: Date.now(),
               })
               : { applied: false, effect: 'stale_generation' };
           }
@@ -628,11 +613,12 @@ export async function handleWithRotation({
             retrySame = true;
           } else if (decision.action === 'retry_replaced') {
             // No wire dispatch happened: the same path now carries new material. Re-select once.
-            if (replacedRetried.has(account.id)) {
+            if (replacedRetried.has(account.id) || !fresh.account) {
               retry = false;
               decision.stopReason = 'credential_replaced_again';
             } else {
               replacedRetried.add(account.id);
+              accounts = accounts.map((candidate) => candidate.id === account.id ? fresh.account : candidate);
               tried.delete(account.id);
               retry = true;
               retrySame = false;
@@ -1008,15 +994,15 @@ async function readJsonBody(upstreamResponse, account, generation) {
   }
 }
 
-function validateNativeBody(json, account, generation) {
+function validateNativeBody(json, account, generation, observedStatus) {
   if (!json || typeof json !== 'object' || Array.isArray(json)) throw malformedShape(account.id, generation);
   const explicitError = explicitUpstreamError(json);
-  if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
+  if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus });
   const wrapper = json?.response ?? json;
   const blocked = Boolean(wrapper?.promptFeedback?.blockReason) && !wrapper?.candidates?.length;
   const terminal = rawFinishReason(json);
   if (terminal !== null && !isSuccessfulTerminal(terminal)) {
-    throw unsuccessfulTerminal(account.id, terminal, generation);
+    throw unsuccessfulTerminal(account.id, generation);
   }
   // A prompt-level refusal is a documented successful outcome; a candidate without a terminal is not.
   if (terminal === null && !blocked) throw truncatedCompletion(account.id, generation);
@@ -1040,11 +1026,11 @@ async function collectFrames(options, shape) {
     observeFrameShape(json, shape);
     // an upstream error object is a failure, not an empty completion - bare or wrapped
     const explicitError = explicitUpstreamError(json);
-    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status });
     const wrapper = json?.response ?? json;
     const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
     const terminal = rawFinishReason(json);
-    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal, generation);
+    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, generation);
     // a documented refusal or an explicit successful terminal, never the translate default
     if (terminal === null && !blocked) throw truncatedCompletion(account.id, generation);
     return antigravityToOpenAi(json, { model });
@@ -1070,9 +1056,9 @@ async function collectFrames(options, shape) {
     observeFrameShape(frame, shape);
     // an explicit upstream error is a failure, not a keepalive - bare or in the response wrapper
     const explicitError = explicitUpstreamError(frame);
-    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status });
     const terminal = rawFinishReason(frame);
-    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal, generation);
+    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, generation);
     const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
     if (hasSignatureProgress(frame) || isMeaningfulChunk(out)) {
       // only real progress counts for the flow timers: a keepalive never satisfies the first wait
@@ -1180,7 +1166,7 @@ async function handleNonStream({
   });
   timing.prepMs = Date.now() - timing.startedAt;
   const json = await readJsonBody(upstreamResponse, account, generation);
-  const wrapper = validateNativeBody(json, account, generation);
+  const wrapper = validateNativeBody(json, account, generation, upstreamResponse.status);
   const { antigravityToGeminiNative } = await import('../rewrite/gemini-native.js');
   const nativeJson = antigravityToGeminiNative(json);
   call?.syncFromBudget?.(budget);
@@ -1279,10 +1265,10 @@ async function handleStream({
       try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id, generation); }
       // an explicit upstream error is a failure, not a quietly finished answer - bare or wrapped
       const explicitError = explicitUpstreamError(frame);
-      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
+      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status });
       const terminal = rawFinishReason(frame);
       // an unsuccessful or unknown terminal must never reach the client as a clean stop
-      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal, generation);
+      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, generation);
       const openAiChunk = antigravityChunkToOpenAiChunk(frame, { model: openAiBody.model, indexRef });
       if (hasSignatureProgress(frame) || isMeaningfulChunk(openAiChunk)) {
         timing.firstFrameMs ??= Date.now() - timing.startedAt;
@@ -1313,8 +1299,7 @@ async function handleStream({
       ...failureFields(describeFailure(failed)),
     });
     if (!res.writableEnded && !res.destroyed) {
-      const detail = failed instanceof UpstreamError ? failed.message : publicFailureText(describeFailure(failed).reason);
-      const message = `upstream stream failed: ${detail} (ref ${requestId})`;
+      const message = `upstream stream failed: ${safeClientMessage(failed, requestId)}`;
       res.write(`data: ${JSON.stringify({ error: { message, type: 'server_error' } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
