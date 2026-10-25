@@ -1,3 +1,4 @@
+import { errorCategory } from '../utils/error-category.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -72,7 +73,7 @@ export class CredentialStore {
           this.logger.warn('credentials.partial_write_fallback', { account: accountLabel(file) });
         } else {
           // a JSON.parse message can quote the token it choked on, so only the category travels
-          this.logger.warn('credentials.unreadable', { account: accountLabel(file), reason: error?.name ?? 'error' });
+          this.logger.warn('credentials.unreadable', { account: accountLabel(file), reason: errorCategory(error) });
         }
       }
     }

@@ -101,7 +101,7 @@ the native `generateContent` lane stays buffered: it has no frames to measure, s
 
 ## journal
 
-every line is payload-free by contract: no prompt or completion text, no upstream body, no refusal text, no token, no email, no credential path, no project id, no proxy credentials. accounts appear as a stable alias - `acct-` plus eight hex characters of the sha256 of their credential path - so lines still correlate across restarts; a refusal is a boolean (`blocked=true`), failures are a category (`reason="quota:429"`, `"client_disconnected"`, `"first_frame_timeout"`).
+every line is payload-free by contract: no prompt or completion text, no upstream body, no refusal text, no token, no email, no credential path, no project id, no proxy credentials. accounts appear as a stable alias - `acct-` plus eight hex characters of the sha256 of their credential path - so lines still correlate across restarts; a refusal is a boolean (`blocked=true`), failures use a fixed vocabulary of categories (unknown error metadata falls back to `error` or `other`; `reason="quota:429"`, `"client_disconnected"`, `"first_frame_timeout"`).
 
 - `attempt.timing requestId= attempt= account= stream= outcome= status= reason= prepMs= firstFrameMs= totalMs=` - one per account attempt. `firstFrameMs` is the wait for the first *meaningful* frame, so keepalive-only attempts report `null`.
 - `request.timing requestId= outcome= status= attempts= reason= totalMs= deadlineMs=` - one per request; `outcome` is `ok`, `failed`, `deadline`, `client_abort` or `vertex_fallback`.

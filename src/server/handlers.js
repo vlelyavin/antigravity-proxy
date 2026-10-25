@@ -2,6 +2,7 @@ import { antigravityToOpenAi, antigravityChunkToOpenAiChunk } from '../rewrite/o
 import { abortFailure, UpstreamError, upstreamErrorFromJson } from '../upstream/upstream-client.js';
 import { generateViaVertexFallback, isGeminiFamily, openAiJsonToStreamFrames } from '../upstream/vertex-fallback.js';
 import { accountLabel } from '../utils/alias.js';
+import { errorCategory } from '../utils/error-category.js';
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
@@ -76,11 +77,18 @@ function requestIdFor(req) {
  * Payload-free failure classification for the journal: a structured kind and status, never an
  * upstream message body (those echo prompts), never a token, path or email.
  */
+const FAILURE_KINDS = new Set(['other', 'quota', 'auth', 'client_abort', 'deadline', 'terminal',
+  'timeout', 'malformed', 'truncated', 'stream', 'first_frame_timeout', 'idle_timeout',
+  'attempt_timeout', 'request_deadline']);
+
 export function failureReason(error) {
   if (!error) return null;
-  if (error instanceof UpstreamError) return `${error.kind}:${error.status}`;
-  if (typeof error.code === 'string') return error.code;
-  return error.name || 'error';
+  if (error instanceof UpstreamError) {
+    const kind = FAILURE_KINDS.has(error.kind) ? error.kind : 'other';
+    const status = Number.isInteger(error.status) ? error.status : 502;
+    return `${kind}:${status}`;
+  }
+  return errorCategory(error);
 }
 
 function clientAbortError() {
@@ -650,7 +658,7 @@ function reportedStreamFailure(error, accountId) {
   const wrapped = new UpstreamError(error?.message ?? 'upstream stream failed', {
     status: timedOut ? 504 : 502,
     accountId,
-    kind: code ?? 'stream',
+    kind: timedOut ? code : 'stream',
   });
   wrapped.reported = true;
   return wrapped;

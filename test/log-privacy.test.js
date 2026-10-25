@@ -12,8 +12,9 @@ import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { accountLabel } from '../src/utils/alias.js';
 import { CredentialStore } from '../src/credentials/credential-store.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
+import { failureReason, handleWithRotation } from '../src/server/handlers.js';
 import { createServer } from '../src/server/create-server.js';
 
 const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
@@ -186,4 +187,29 @@ test('the startup credential line carries labels, not emails or paths', () => {
   assert.match(text, new RegExp(`accounts=\\[${JSON.stringify(accountLabel(ACCOUNT))}\\]`));
   assert.match(text, /projects=\["set"\]/);
   assertAbsent(text, ['sentinel@example.test', 'sentinel-token.json', '/home/sentinel', 'SENTINEL_PROJECT_ID']);
+});
+
+test('arbitrary error codes, names and kinds never become journal categories', { timeout: 2000 }, async () => {
+  const sink = journal();
+  const secret = 'SENTINEL_ERROR_METADATA';
+  for (const error of [Object.assign(new Error(secret), { code: secret, name: secret }),
+    new UpstreamError(secret, { kind: secret })]) {
+    sink.logger.error('synthetic.failed', { reason: failureReason(error) });
+  }
+  const error = Object.assign(new Error('client-facing stream detail'), { code: secret, name: secret });
+  const upstream = { invalidate() {}, async generateStream() {
+    return { body: (async function* () { throw error; })() };
+  } };
+  const res = { headersSent: false, writeHead() { this.headersSent = true; }, write() { return true; }, end() { this.writableEnded = true; } };
+  await assert.rejects(handleWithRotation({
+    pool: new AccountPool({ logger: sink.logger }), store: { readAll: () => [ACCOUNT] }, upstream,
+    config: { ...CONFIG, fallback: { enabled: false } }, logger: sink.logger,
+    openAiBody: { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }], stream: true },
+    res, signal: null,
+  }));
+  assert.match(sink.text(), /stream\.failed/);
+  assert.match(sink.text(), /outcome="stream_failed"/);
+  assertAbsent(sink.text(), [secret, 'client-facing stream detail']);
+  assert.equal(failureReason(Object.assign(new Error('detail'), { code: 'ECONNRESET' })), 'ECONNRESET');
+  assert.equal(failureReason(new SyntaxError('private token')), 'SyntaxError');
 });

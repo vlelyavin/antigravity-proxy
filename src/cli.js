@@ -1,3 +1,4 @@
+import { errorCategory } from './utils/error-category.js';
 import { loadConfig } from './config/load-config.js';
 import { createLogger } from './utils/logger.js';
 import { CredentialStore } from './credentials/credential-store.js';
@@ -40,6 +41,6 @@ server.listen(config.listen.port, config.listen.host, () => {
       }),
     });
   } catch (error) {
-    logger.warn('credentials.missing', { reason: error?.name ?? 'error' });
+    logger.warn('credentials.missing', { reason: errorCategory(error) });
   }
 });
