@@ -27,7 +27,7 @@ const ACCOUNTS = [
 const BODY = { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'synthetic' }], stream: false };
 
 const frame = (parts, finishReason) => ({
-  response: { candidates: [{ content: { parts }, ...(finishReason ? { finishReason } : {}) }] },
+  response: { candidates: [{ content: { parts }, ...(finishReason !== undefined ? { finishReason } : {}) }] },
 });
 
 function recorder() {
@@ -221,4 +221,20 @@ test('a tool signature and a refusal still travel with a documented terminal', a
   });
   assert.equal(refused.raw.choices[0].finish_reason, 'content_filter');
   assert.equal(refused.raw.choices[0].message.tool_calls[0].thought_signature, 'sig');
+});
+
+// A provider's malformed type must not bypass validation and hit the translator's stop default.
+test('non-string and empty terminal values fail JSON, SSE collection and client SSE', { timeout: 5000 }, async () => {
+  for (const reason of [7, true, {}, [], ['STOP'], '']) {
+    const entry = frame([{ text: 'partial' }], reason);
+    for (const response of [sse([entry]), Response.json(entry)]) {
+      await assert.rejects(collect({ responses: [response], accounts: [ACCOUNTS[0]] }),
+        (error) => error instanceof UpstreamError && error.kind === 'terminal', String(reason));
+    }
+    const streamed = await collectStream({ frames: [entry], accounts: ACCOUNTS });
+    assert.match(streamed.text, /upstream stream failed/);
+    assert.doesNotMatch(streamed.text, /"finish_reason":"stop"/);
+    assert.equal(streamed.events.filter((e) => e.event === 'attempt.timing').length, 1);
+    assert.equal(streamed.events.find((e) => e.event === 'request.timing').outcome, 'failed');
+  }
 });

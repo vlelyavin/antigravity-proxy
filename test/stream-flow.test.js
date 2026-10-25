@@ -69,7 +69,7 @@ function lane({ mode = 'flow', gapMs = 20, frames = 8 } = {}) {
       timers.push(setInterval(() => {
         sent += 1;
         if (sent < frames) {
-          res.write(`data: ${JSON.stringify(frame('x'))}\n\n`);
+          res.write(`data: ${JSON.stringify((mode === 'signature' ? { response: { candidates: [{ content: { parts: [{ thoughtSignature: 'synthetic-signature' }] } }] } } : frame('x')))}\n\n`);
           return;
         }
         res.write(`data: ${JSON.stringify(frame('x', 'STOP'))}\n\n`);
@@ -284,4 +284,23 @@ test('the flow watchdog clears its first wait on progress, re-arms idle, and lea
   disposed.dispose();
   await sleep(120);
   assert.equal(late, 0, 'a disposed watchdog leaves no timer behind');
+});
+
+test('signature-only frames count as progress before translation drops empty deltas', { timeout: 5000 }, async () => {
+  for (const stream of [false, true]) {
+    const stack = await startStage({ mode: 'signature', gapMs: 25, frames: 12, accounts: [ACCOUNTS[0]],
+      rotation: { firstMeaningfulFrameTimeoutMs: 150, idleTimeoutMs: 150 } });
+    try {
+      const result = await request(stack.port, { stream });
+      assert.equal(result.status, 200);
+      assert.ok(result.elapsedMs >= 250, 'the answer outlives the initial wait');
+      assert.doesNotMatch(result.text, /upstream stream failed/);
+      const attempt = stack.events.find((e) => e.event === 'attempt.timing');
+      assert.equal(attempt.outcome, 'ok');
+      assert.ok(attempt.firstFrameMs < 150, 'signature satisfies the first meaningful wait');
+      assert.equal(stack.starts.length, 1);
+    } finally {
+      stack.close();
+    }
+  }
 });

@@ -119,11 +119,11 @@ export function isSuccessfulTerminal(finishReason) {
 function rawFinishReason(frame) {
   const wrapper = frame?.response ?? frame;
   const reason = wrapper?.candidates?.[0]?.finishReason;
-  return typeof reason === 'string' && reason !== '' ? reason : null;
+  return reason ?? null;
 }
 
 function unsuccessfulTerminal(accountId, finishReason) {
-  return new UpstreamError(`upstream finished with an unsuccessful finish reason: ${finishReason}`, {
+  return new UpstreamError(`upstream finished with an unsuccessful finish reason: ${typeof finishReason === 'string' ? finishReason : 'invalid type'}`, {
     status: 502, accountId, kind: 'terminal',
   });
 }
@@ -133,6 +133,12 @@ function unsuccessfulTerminal(accountId, finishReason) {
  * candidates, keepalives and role-only deltas are none of those - they keep the socket warm and
  * nothing else.
  */
+function hasSignatureProgress(frame) {
+  const wrapper = frame?.response ?? frame;
+  const parts = wrapper?.candidates?.[0]?.content?.parts;
+  return Array.isArray(parts) && parts.some((part) => typeof part?.thoughtSignature === 'string' && part.thoughtSignature !== '');
+}
+
 export function isMeaningfulChunk(chunk) {
   const choice = chunk?.choices?.[0];
   if (!choice) return false;
@@ -479,9 +485,9 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     const wrapper = json?.response ?? json;
     const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
     const terminal = rawFinishReason(json);
-    if (!terminal && !blocked) throw truncatedCompletion(account.id);
+    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
     // a documented refusal or an explicit successful terminal, never the translate default
-    if (terminal && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
+    if (terminal === null && !blocked) throw truncatedCompletion(account.id);
     return antigravityToOpenAi(json, { model });
   }
   const indexRef = { count: 0, first: true };
@@ -503,13 +509,15 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     let frame;
     try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id); }
     if (frame?.error) throw upstreamErrorFromJson(frame.error, account.id);
+    const terminal = rawFinishReason(frame);
+    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
     const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
-    if (!out) return; // keepalive: no content, no finish reason, no refusal
-    if (isMeaningfulChunk(out)) {
+    if (hasSignatureProgress(frame) || isMeaningfulChunk(out)) {
       // only real progress counts for the flow timers: a keepalive never satisfies the first wait
       timing.firstFrameMs ??= Date.now() - timing.startedAt;
       flow?.progress();
     }
+    if (!out) return; // signature-only progress emits no client delta; keepalives do neither
     id ??= out.id;
     if (out.usage) usage = out.usage;
     const choice = out.choices && out.choices[0];
@@ -530,9 +538,6 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     }
     // only an explicit terminal frame counts as the end of a generation
     if (choice.finish_reason) {
-      const terminal = rawFinishReason(frame);
-      // an explicit but unsuccessful or unknown reason is not a successful end
-      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
       finishReason = choice.finish_reason;
     }
   };
@@ -680,11 +685,11 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
       // an unsuccessful or unknown terminal must never reach the client as a clean stop
       if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
       const openAiChunk = antigravityChunkToOpenAiChunk(frame, { model: openAiBody.model, indexRef });
+      if (hasSignatureProgress(frame) || isMeaningfulChunk(openAiChunk)) {
+        timing.firstFrameMs ??= Date.now() - timing.startedAt;
+        flow?.progress();
+      }
       if (openAiChunk) {
-        if (isMeaningfulChunk(openAiChunk)) {
-          timing.firstFrameMs ??= Date.now() - timing.startedAt;
-          flow?.progress();
-        }
         if (openAiChunk.choices[0].finish_reason) terminalSeen = true;
         blocked ||= Boolean(openAiChunk.choices[0].delta?.refusal);
         if (!res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`)) {
