@@ -302,6 +302,12 @@ function malformedFrame(accountId) {
   return new UpstreamError('upstream sent a malformed SSE frame', { status: 502, accountId, kind: 'malformed' });
 }
 
+function truncatedCompletion(accountId) {
+  return new UpstreamError('upstream response ended without a finish reason (truncated)', {
+    status: 502, accountId, kind: 'truncated',
+  });
+}
+
 // non-stream клиенту отдаём обычный JSON, но к апстриму идём стримом:
 // generateContent собирает ответ целиком и на длинных текстах выходит за
 // любой разумный таймаут, streamGenerateContent отдаёт те же данные первого
@@ -318,6 +324,9 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     const json = await upstreamResponse.json();
     // an upstream error object is a failure, not an empty completion
     if (json?.error) throw upstreamErrorFromJson(json.error, account.id);
+    const wrapper = json?.response ?? json;
+    const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
+    if (!wrapper?.candidates?.[0]?.finishReason && !blocked) throw truncatedCompletion(account.id);
     return antigravityToOpenAi(json, { model });
   }
   const indexRef = { count: 0, first: true };
@@ -375,9 +384,7 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
   // A finished generation always carries a finishReason. Without one the body was cut short:
   // answering "stop" here handed the client a truncated answer as a complete one.
   if (finishReason === null) {
-    throw new UpstreamError('upstream stream ended without a finish reason (truncated)', {
-      status: 502, accountId: account.id, kind: 'truncated',
-    });
+    throw truncatedCompletion(account.id);
   }
 
   const message = { role: 'assistant', content: content || (toolCalls.size ? null : '') };

@@ -55,13 +55,14 @@ function sseResponse(frames, { chunkSize = 0, trailingBreak = true } = {}) {
  * Runs one non-stream request with a synthetic upstream, so the collector sees exactly the frames
  * a real generation would send. `responses` gives each call its own frame list (rotation tests).
  */
-async function collect({ frames = [], responses = null, chunkSize = 0, trailingBreak = true, accounts = ACCOUNTS, attemptTimeoutsMs = [] } = {}) {
+async function collect({ frames = [], responses = null, json = null, chunkSize = 0, trailingBreak = true, accounts = ACCOUNTS, attemptTimeoutsMs = [] } = {}) {
   const { logger, events } = recorder();
   const pool = new AccountPool({ logger });
   let call = 0;
   const upstream = {
     invalidate() {},
     async generateStream() {
+      if (json) return Response.json(json);
       const next = responses ? responses[call++] : frames;
       return sseResponse(next, { chunkSize, trailingBreak });
     },
@@ -102,6 +103,16 @@ test('a stream that ends without a terminal frame is a failure, not a fabricated
     collect({ frames: [frame([{ text: 'unfinished fragment' }])] }),
     (error) => error instanceof UpstreamError && error.status === 502 && /finish reason/.test(error.message),
   );
+});
+
+test('plain JSON on the SSE endpoint requires a terminal candidate or a prompt refusal', async () => {
+  for (const json of [{}, frame([{ text: 'unfinished fragment' }])]) {
+    await assert.rejects(collect({ json }), (error) => error instanceof UpstreamError && error.kind === 'truncated');
+  }
+  const terminal = await collect({ json: frame([{ text: 'complete' }], 'STOP') });
+  assert.equal(terminal.raw.choices[0].message.content, 'complete');
+  const refused = await collect({ json: { response: { promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } } } });
+  assert.equal(refused.raw.choices[0].message.refusal, 'PROHIBITED_CONTENT');
 });
 
 test('an explicit upstream error frame rotates to the next account instead of succeeding', async () => {

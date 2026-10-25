@@ -92,6 +92,8 @@ every request has one total budget, `rotation.requestDeadlineMs` (default 110 s)
 
 a client that cannot wait out a hung upstream sends `x-attempt-timeouts-ms: 45000,30000` (non-stream only): the first account gets min(45 s, what is left of the budget), the next one min(30 s, the rest, the last value repeats), then the vertex fallback answers with the remainder. no header - no per-attempt cut, only the total budget. mari sends it; hermes and opencode don't.
 
+non-stream collection requires an explicit finish reason or prompt refusal, including when the streaming endpoint answers plain JSON. an incomplete response fails instead of becoming a fabricated `stop`.
+
 ## systemd
 
 ```bash
