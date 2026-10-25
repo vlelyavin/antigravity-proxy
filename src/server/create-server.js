@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { checkApiKey, errorResponse, handleWithRotation } from './handlers.js';
+import { checkApiKey, errorResponse, failureReason, handleWithRotation } from './handlers.js';
 import { modelsPayload } from '../rewrite/models.js';
 import { UpstreamError } from '../upstream/upstream-client.js';
 
@@ -82,7 +82,8 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
   const server = http.createServer((req, res) => {
     // top-level guard: one malformed request must never take the process down
     Promise.resolve(handle(req, res)).catch((error) => {
-      logger.error('request.unhandled', { error: error.message });
+      // the journal is payload-free: a category, never the message
+      logger.error('request.unhandled', { reason: failureReason(error) });
       if (!res.headersSent) {
         try { errorResponse(res, 500, `internal error: ${error.message}`); } catch { /* socket gone */ }
       } else {
@@ -155,7 +156,7 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
           ? error.status
           : (error.status === 400 ? 400 : 502);
         const type = status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' : 'server_error';
-        logger.error('chat.failed', { status, error: error.message });
+        logger.error('chat.failed', { status, reason: failureReason(error) });
         if (!res.headersSent) errorResponse(res, status, error.message, type);
         else res.end();
       } finally {
@@ -194,7 +195,7 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
           return;
         }
         const status = error instanceof UpstreamError ? error.status : (error.status === 400 ? 400 : 502);
-        logger.error('native.failed', { status, error: error.message });
+        logger.error('native.failed', { status, reason: failureReason(error) });
         if (!res.headersSent) {
           errorResponse(res, status, error.message, status === 429 ? 'rate_limit_error' : 'server_error');
         } else res.end();
@@ -208,7 +209,7 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
   }
 
   server.on('error', (error) => {
-    logger.error('server.start_failed', { error: error.message });
+    logger.error('server.start_failed', { reason: failureReason(error) });
     process.exitCode = 1;
   });
 

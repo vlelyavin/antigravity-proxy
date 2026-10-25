@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { accountLabel } from '../utils/alias.js';
 
 export class CredentialStoreError extends Error {
   constructor(message, options = {}) {
@@ -67,9 +68,11 @@ export class CredentialStore {
         const good = this.lastGood.get(file);
         if (good) {
           accounts.push(good);
-          this.logger.warn('credentials.partial_write_fallback', { file });
+          // a credential path is payload for the journal: only its stable label travels
+          this.logger.warn('credentials.partial_write_fallback', { account: accountLabel(file) });
         } else {
-          this.logger.warn('credentials.unreadable', { file, error: error.message });
+          // a JSON.parse message can quote the token it choked on, so only the category travels
+          this.logger.warn('credentials.unreadable', { account: accountLabel(file), reason: error?.name ?? 'error' });
         }
       }
     }

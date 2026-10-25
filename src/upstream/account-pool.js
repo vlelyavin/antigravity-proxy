@@ -1,3 +1,5 @@
+import { accountLabel } from '../utils/alias.js';
+
 /**
  * Sticky account selection: every request goes to the first healthy account in credential order;
  * the next one takes over only when it is cooling down after a 429 RESOURCE_EXHAUSTED (or 401
@@ -26,8 +28,12 @@ export class AccountPool {
     return this.healthy(accounts).find((a) => !tried.has(a.id)) ?? null;
   }
 
-  cooldown(accountId, ms) {
+  /**
+   * `account` is the anonymised label for the journal (acct-<hash>); the credential id itself is a
+   * file path and never reaches a log line.
+   */
+  cooldown(accountId, ms, account = accountLabel(accountId)) {
     this.coolUntil.set(accountId, Date.now() + ms);
-    this.logger.warn('account.cooldown', { accountId, ms });
+    this.logger.warn('account.cooldown', { account, ms });
   }
 }
