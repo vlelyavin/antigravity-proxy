@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { CredentialStore } from '../src/credentials/credential-store.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { isGeminiFamily, vertexModelName } from '../src/upstream/vertex-fallback.js';
@@ -72,7 +72,7 @@ async function startStack({ accounts, vertexOpts = {}, fallbackEnabled = true } 
     upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamServer.address().port}`, apiVersion: 'v1internal', eagerRefreshMs: 0, egress: { url: null } },
     fallback: { vertexUrl, enabled: fallbackEnabled, timeoutMs: vertexOpts.timeoutMs ?? 5000 },
   };
-  const upstreamClient = new UpstreamClient({ config, logger });
+  const upstreamClient = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   upstreamClient.accessToken = async () => 'test-token';
 
   const pool = new AccountPool({ logger });
@@ -87,7 +87,7 @@ async function post(port, body) {
   });
 }
 
-const ONE_ACCOUNT = [{ id: 'a1', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }];
+const ONE_ACCOUNT = [{ generation: 'synthetic', id: 'a1', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }];
 const GEMINI_429 = { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'TRIGGER_429' }] };
 
 test('isGeminiFamily / vertexModelName', () => {

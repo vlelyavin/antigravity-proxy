@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { CredentialStore } from '../src/credentials/credential-store.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 
@@ -54,13 +54,13 @@ async function startStack(projectIds) {
 
   const logger = createLogger('error');
   const store = new CredentialStore({ searchPaths: [], logger });
-  store.readAll = () => projectIds.map((projectId, i) => ({ id: `a${i}`, email: `a${i}@x`, projectId }));
+  store.readAll = () => projectIds.map((projectId, i) => ({ generation: 'synthetic', id: `a${i}`, email: `a${i}@x`, projectId }));
   const config = {
     ...CONFIG,
     upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstream.server.address().port}`, apiVersion: 'v1internal', eagerRefreshMs: 0, egress: { url: null } },
     fallback: { vertexUrl: `http://127.0.0.1:${vertex.address().port}/v1/chat/completions`, enabled: true, timeoutMs: 5000 },
   };
-  const upstreamClient = new UpstreamClient({ config, logger });
+  const upstreamClient = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   upstreamClient.accessToken = async () => 'test-token';
   const server = createServer({ config, credentialStore: store, upstream: upstreamClient, pool: new AccountPool({ logger }), logger });
   await once(server.listen(0), 'listening');

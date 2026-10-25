@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountPool } from '../src/upstream/account-pool.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { antigravityToOpenAi, antigravityChunkToOpenAiChunk } from '../src/rewrite/openai-translate.js';
 
 const logger = { info() {}, warn() {}, error() {} };
-const A = { id: '/home/u/.gemini/antigravity-cli/antigravity-oauth-token', email: 'a@x' };
-const B = { id: '/home/u/.antigravity-proxy/accounts/acc2.json', email: null };
+const A = { generation: 'synthetic', id: '/home/u/.gemini/antigravity-cli/antigravity-oauth-token', email: 'a@x' };
+const B = { generation: 'synthetic', id: '/home/u/.antigravity-proxy/accounts/acc2.json', email: null };
 
 test('the pool stays on the first account while it is healthy', () => {
   const pool = new AccountPool({ logger });
@@ -35,7 +35,7 @@ test('a request never retries an account it already tried', () => {
 });
 
 test('effective egress identity includes the authenticated session, and only its alias is exposable', () => {
-  const client = new UpstreamClient({
+  const client = new UpstreamClient({ currentGeneration: generationOf,
     logger,
     config: { upstream: { egress: { url: null, accounts: {
       'a@x': 'socks5://alice:secret@127.0.0.1:1055',
@@ -51,17 +51,17 @@ test('effective egress identity includes the authenticated session, and only its
 });
 
 test('each account resolves its own egress: by email, else by credential file name, else the default', () => {
-  const client = new UpstreamClient({
+  const client = new UpstreamClient({ currentGeneration: generationOf,
     logger,
     config: { upstream: { egress: { url: 'socks5://127.0.0.1:1055', accounts: { 'a@x': 'socks5://127.0.0.1:1056', 'acc2.json': 'http://127.0.0.1:18881' } } } },
   });
   assert.equal(client.egressFor(A), 'socks5://127.0.0.1:1056');
   assert.equal(client.egressFor(B), 'http://127.0.0.1:18881');
-  assert.equal(client.egressFor({ id: '/x/other.json' }), 'socks5://127.0.0.1:1055');
+  assert.equal(client.egressFor({ generation: 'synthetic', id: '/x/other.json' }), 'socks5://127.0.0.1:1055');
 });
 
 test('the oauth refresh leaves through the account egress, not the host', async () => {
-  const client = new UpstreamClient({
+  const client = new UpstreamClient({ currentGeneration: generationOf,
     logger,
     config: { upstream: { eagerRefreshMs: 0, egress: { url: null, accounts: { 'acc2.json': 'socks5://127.0.0.1:1056' } } } },
   });

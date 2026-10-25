@@ -134,9 +134,10 @@ function isTimeoutCode(code) {
  *   dial/CONNECT failure is attributed to that egress and never falls back to a direct connection
  */
 export class UpstreamClient {
-  constructor({ config, logger }) {
+  constructor({ config, logger, currentGeneration }) {
     this.config = config;
     this.logger = logger;
+    this.currentGeneration = currentGeneration;
     // in-memory token cache: accountId -> { token, expiresAt, generation, version }
     this.tokens = new Map();
     // accountId -> { projectId, generation }
@@ -147,6 +148,24 @@ export class UpstreamClient {
     this.refreshing = new Map();
     this.tokenVersion = 0;
     this.projectVersion = 0;
+  }
+
+  #assertCurrent(account, phase) {
+    let current;
+    try { current = this.currentGeneration(account); } catch { current = null; }
+    if (typeof current !== 'string' || current === '') {
+      throw new UpstreamError('credential ownership unavailable', {
+        origin: 'local', phase, reason: 'invalid_local_config', scope: 'request',
+        evidence: 'credential_generation', publicStatus: 503,
+      });
+    }
+    if (current !== generationOf(account)) {
+      throw new UpstreamError('credential replaced during preparation', {
+        origin: 'local', phase, reason: 'credential_replaced', scope: 'credential',
+        evidence: 'credential_generation', publicStatus: 503,
+        accountId: account.id, generation: generationOf(account),
+      });
+    }
   }
 
   agentFor(egressUrl) {
@@ -309,6 +328,7 @@ export class UpstreamClient {
   }
 
   async accessToken(account, { fetchImpl = this.#fetchVia(this.egressFor(account)), budget = null } = {}) {
+    this.#assertCurrent(account, 'refresh');
     const generation = generationOf(account);
     const cached = this.tokens.get(account.id);
     const eager = this.config.upstream.eagerRefreshMs;
@@ -332,9 +352,11 @@ export class UpstreamClient {
     const promise = (async () => {
       const { refreshAccessToken } = await import('../credentials/oauth.js');
       try {
+        this.#assertCurrent(account, 'refresh');
         const { accessToken, expiresIn } = await refreshAccessToken(account.refreshToken, {
           fetchImpl: this.#boundedFetch(fetchImpl, this.config.upstream.requestTimeoutMs),
         });
+        this.#assertCurrent(account, 'refresh');
         // A material replacement while the refresh was in flight must not cache the old token.
         if (generationOf(account) !== generation) {
           throw new UpstreamError('credential replaced during refresh', {
@@ -412,6 +434,7 @@ export class UpstreamClient {
    * its request and body read.
    */
   async ensureProject(account, { signal, budget = null } = {}) {
+    this.#assertCurrent(account, 'project_resolution');
     const generation = generationOf(account);
     if (account.projectId) return account.projectId;
     const cached = this.projects.get(account.id);
@@ -426,6 +449,7 @@ export class UpstreamClient {
       });
     }
     const projectVersion = ++this.projectVersion;
+    this.#assertCurrent(account, 'project_resolution');
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:loadCodeAssist`;
     const body = JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } });
     const headers = {
@@ -453,6 +477,7 @@ export class UpstreamClient {
       });
     }
     if (signal?.aborted) throw abortFailure(signal);
+    this.#assertCurrent(account, 'project_resolution');
     const project = json?.cloudaicompanionProject ?? json?.projectId ?? json?.project ?? null;
     if (!project || typeof project !== 'string') {
       throw new UpstreamError('loadCodeAssist returned no project', {

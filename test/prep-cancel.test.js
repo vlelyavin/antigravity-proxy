@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config/load-config.js';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 
 const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 const BODY = { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'synthetic' }] };
@@ -19,7 +19,7 @@ function recorder() {
 
 test('the project probe is cancelled with the caller that started it', { timeout: 2000 }, async () => {
   const { logger } = recorder();
-  const client = new UpstreamClient({ config: CONFIG, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config: CONFIG, logger });
   client.accessToken = async () => 'synthetic-token';
   const probes = [];
   let markProbeStarted;
@@ -34,7 +34,7 @@ test('the project probe is cancelled with the caller that started it', { timeout
   };
   const leaving = new AbortController();
   const reason = new Error('client disconnected');
-  const pending = client.generate({ openAiBody: BODY, account: { id: 'probe-account', refreshToken: 'r' }, signal: leaving.signal });
+  const pending = client.generate({ openAiBody: BODY, account: { generation: 'synthetic', id: 'probe-account', refreshToken: 'r' }, signal: leaving.signal });
   await probeStarted;
   assert.equal(probes.length, 1);
   assert.match(probes[0].url, /loadCodeAssist/);
@@ -46,20 +46,20 @@ test('the project probe is cancelled with the caller that started it', { timeout
 
 test('an already cancelled caller starts no project probe', { timeout: 2000 }, async () => {
   const { logger } = recorder();
-  const client = new UpstreamClient({ config: CONFIG, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config: CONFIG, logger });
   let probes = 0;
   client.accessToken = async () => 'synthetic-token';
   client.request = async () => { probes += 1; return { ok: true, json: async () => ({ cloudaicompanionProject: 'p' }) }; };
   const leaving = new AbortController();
   const reason = new Error('client disconnected');
   leaving.abort(reason);
-  await assert.rejects(client.ensureProject({ id: 'probe-account' }, { signal: leaving.signal }), (error) => error === reason);
+  await assert.rejects(client.ensureProject({ generation: 'synthetic', id: 'probe-account' }, { signal: leaving.signal }), (error) => error === reason);
   assert.equal(probes, 0);
 });
 
 test('a caller that leaves while the shared refresh runs starts no probe afterwards', { timeout: 2000 }, async () => {
   const { logger } = recorder();
-  const client = new UpstreamClient({ config: CONFIG, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config: CONFIG, logger });
   let probes = 0;
   let markRefreshStarted;
   const refreshStarted = new Promise((resolve) => { markRefreshStarted = resolve; });
@@ -71,7 +71,7 @@ test('a caller that leaves while the shared refresh runs starts no probe afterwa
   client.request = async () => { probes += 1; return { ok: true, json: async () => ({ cloudaicompanionProject: 'p' }) }; };
   const leaving = new AbortController();
   const reason = new Error('client disconnected');
-  const pending = client.ensureProject({ id: 'probe-account' }, { signal: leaving.signal });
+  const pending = client.ensureProject({ generation: 'synthetic', id: 'probe-account' }, { signal: leaving.signal });
   await refreshStarted;
   setTimeout(() => leaving.abort(reason), 10);
   await assert.rejects(pending, (error) => error === reason);
@@ -81,19 +81,19 @@ test('a caller that leaves while the shared refresh runs starts no probe afterwa
 
 test('the project id is cached: one probe, then the in-memory value', { timeout: 2000 }, async () => {
   const { logger } = recorder();
-  const client = new UpstreamClient({ config: CONFIG, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config: CONFIG, logger });
   client.accessToken = async () => 'synthetic-token';
   let probes = 0;
   client.request = async () => {
     probes += 1;
     return { ok: true, json: async () => ({ cloudaicompanionProject: 'project-from-probe' }) };
   };
-  const account = { id: 'cache-account' };
+  const account = { generation: 'synthetic', id: 'cache-account' };
   assert.equal(await client.ensureProject(account), 'project-from-probe');
-  assert.equal(await client.ensureProject({ id: 'cache-account' }), 'project-from-probe');
+  assert.equal(await client.ensureProject({ generation: 'synthetic', id: 'cache-account' }), 'project-from-probe');
   assert.equal(probes, 1);
   // a credential file that already carries the project never probes at all
-  assert.equal(await client.ensureProject({ id: 'other', projectId: 'from-file' }), 'from-file');
+  assert.equal(await client.ensureProject({ generation: 'synthetic', id: 'other', projectId: 'from-file' }), 'from-file');
   assert.equal(probes, 1);
 });
 
@@ -104,7 +104,7 @@ test('a hung token endpoint is bounded by the transport timeout and does not pin
   t.after(() => clearInterval(keepAlive));
   const { logger } = recorder();
   const config = { ...CONFIG, upstream: { ...CONFIG.upstream, requestTimeoutMs: 60, eagerRefreshMs: 0, egress: { url: null } } };
-  const client = new UpstreamClient({ config, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   const seen = [];
   const fetchImpl = (url, options = {}) => new Promise((resolve, reject) => {
     seen.push({ url, hasSignal: Boolean(options.signal) });
@@ -112,7 +112,7 @@ test('a hung token endpoint is bounded by the transport timeout and does not pin
   });
   const startedAt = Date.now();
   await assert.rejects(
-    client.accessToken({ id: 'hung-refresh', refreshToken: 'r' }, { fetchImpl }),
+    client.accessToken({ generation: 'synthetic', id: 'hung-refresh', refreshToken: 'r' }, { fetchImpl }),
     (error) => error instanceof UpstreamError
       && error.reason === 'oauth_unavailable'
       && error.publicStatus === 502

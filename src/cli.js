@@ -15,7 +15,10 @@ const credentialStore = new CredentialStore({
   logger,
 });
 
-const upstream = new UpstreamClient({ config, logger });
+const upstream = new UpstreamClient({
+  config, logger,
+  currentGeneration: (account) => credentialStore.readAll().find((current) => current.id === account.id)?.generation,
+});
 const pool = new AccountPool({ logger });
 
 const server = createServer({ config, credentialStore, upstream, pool, logger });

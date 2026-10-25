@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { createFlowWatchdog } from '../src/server/handlers.js';
@@ -15,8 +15,8 @@ import { createFlowWatchdog } from '../src/server/handlers.js';
 const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 const ACCOUNTS = [
-  { id: 'a0', email: 'first@example.com', projectId: 'p' },
-  { id: 'a1', email: 'second@example.com', projectId: 'p' },
+  { generation: 'synthetic', id: 'a0', email: 'first@example.com', projectId: 'p' },
+  { generation: 'synthetic', id: 'a1', email: 'second@example.com', projectId: 'p' },
 ];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -98,7 +98,7 @@ async function startStage({ mode, gapMs, frames, rotation = {}, accounts = ACCOU
     rotation: { ...CONFIG.rotation, cooldownMs: 45_000, requestDeadlineMs: 5000, ...rotation },
     fallback: { enabled: false },
   };
-  const client = new UpstreamClient({ config, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   client.accessToken = async () => 'test-token';
   const pool = new AccountPool({ logger });
   const server = createServer({ config, credentialStore: { readAll: () => accounts }, upstream: client, pool, logger });

@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { CredentialStore } from '../src/credentials/credential-store.js';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 
@@ -67,7 +67,7 @@ async function startStack({ accounts, apiKey = null, upstreamOpts = {} } = {}) {
     upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', eagerRefreshMs: 0, egress: { url: null } },
     apiKey,
   };
-  const upstreamClient = new UpstreamClient({ config, logger });
+  const upstreamClient = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   upstreamClient.accessToken = async () => 'test-token';
 
   const pool = new AccountPool({ logger });
@@ -86,7 +86,7 @@ async function post(port, path, body, headers = {}) {
 }
 
 test('malformed request target does not crash the server (C1)', async () => {
-  const stack = await startStack({ accounts: [{ id: 'c1', projectId: 'p' }] });
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'c1', projectId: 'p' }] });
   try {
     // raw socket with a broken request line
     const socket = net.connect({ host: '127.0.0.1', port: stack.port });
@@ -108,7 +108,7 @@ test('malformed request target does not crash the server (C1)', async () => {
 
 test('request timeout produces 504, not a hang (C2)', async () => {
   const stack = await startStack({
-    accounts: [{ id: 't1', projectId: 'p' }],
+    accounts: [{ generation: 'synthetic', id: 't1', projectId: 'p' }],
     upstreamOpts: { hangMs: 5000 },
   });
   stack.upstreamClient.config.upstream.requestTimeoutMs = 300; // small for the test
@@ -137,9 +137,9 @@ test('client disconnect aborts upstream stream (C4, quota burn guard)', async ()
 
   const logger = createLogger('error');
   const store = new CredentialStore({ searchPaths: [], logger });
-  store.readAll = () => [{ id: 'a1', projectId: 'p' }];
+  store.readAll = () => [{ generation: 'synthetic', id: 'a1', projectId: 'p' }];
   const config = { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', egress: { url: null } } };
-  const upstreamClient = new UpstreamClient({ config, logger });
+  const upstreamClient = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   upstreamClient.accessToken = async () => 'test-token';
   const pool = new AccountPool({ logger });
   const server = createServer({ config, credentialStore: store, upstream: upstreamClient, pool, logger });
@@ -172,9 +172,9 @@ test('mid-stream failure emits error frame + [DONE] (H4)', async () => {
 
   const logger = createLogger('error');
   const store = new CredentialStore({ searchPaths: [], logger });
-  store.readAll = () => [{ id: 'a2', projectId: 'p' }];
+  store.readAll = () => [{ generation: 'synthetic', id: 'a2', projectId: 'p' }];
   const config = { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiVersion: 'v1internal', egress: { url: null } } };
-  const upstreamClient = new UpstreamClient({ config, logger });
+  const upstreamClient = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   upstreamClient.accessToken = async () => 'test-token';
   const pool = new AccountPool({ logger });
   const server = createServer({ config, credentialStore: store, upstream: upstreamClient, pool, logger });
@@ -272,7 +272,7 @@ test('a generic transport 502 fails over without cooling or fabricating a 429', 
 });
 
 test('health is api-key gated when configured (L8)', async () => {
-  const stack = await startStack({ accounts: [{ id: 'k1', projectId: 'p' }], apiKey: 'sk-secret' });
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'k1', projectId: 'p' }], apiKey: 'sk-secret' });
   try {
     const noKey = await fetch(`http://127.0.0.1:${stack.port}/health`);
     assert.equal(noKey.status, 401);

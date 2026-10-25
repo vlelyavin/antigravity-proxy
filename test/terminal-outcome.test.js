@@ -8,7 +8,7 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 import { createServer } from '../src/server/create-server.js';
 import { handleWithRotation, isSuccessfulTerminal } from '../src/server/handlers.js';
 
@@ -21,8 +21,8 @@ const CONFIG_NO_FALLBACK = {
 };
 
 const ACCOUNTS = [
-  { id: 'a0', email: 'first@example.com', projectId: 'p' },
-  { id: 'a1', email: 'second@example.com', projectId: 'p' },
+  { generation: 'synthetic', id: 'a0', email: 'first@example.com', projectId: 'p' },
+  { generation: 'synthetic', id: 'a1', email: 'second@example.com', projectId: 'p' },
 ];
 const BODY = { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'synthetic' }], stream: false };
 
@@ -108,7 +108,7 @@ async function collectStream({ frames, accounts = [ACCOUNTS[0]] }) {
     },
     fallback: { enabled: false },
   };
-  const client = new UpstreamClient({ config, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   client.accessToken = async () => 'test-token';
   const pool = new AccountPool({ logger });
   const server = createServer({ config, credentialStore: { readAll: () => accounts }, upstream: client, pool, logger });
@@ -175,7 +175,7 @@ test('a protocol failure fails the attempt, gets one alternate account and cools
 });
 
 test('six truncating accounts stop after two protocol attempts, cool nobody, and the next request answers', async () => {
-  const accounts = Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, email: `synthetic${i}@example.com`, projectId: 'p' }));
+  const accounts = Array.from({ length: 6 }, (_, i) => ({ generation: 'synthetic', id: `a${i}`, email: `synthetic${i}@example.com`, projectId: 'p' }));
   const stage = rotationStage({ accounts });
   const truncated = () => sse([frame([{ text: 'partial' }])]);
 
@@ -217,7 +217,7 @@ test('unknown, protocol and transient failures share one two-attempt failed-acco
     [['protocol', 'protocol'], ['protocol', 'protocol']],
     [['rate_limited', 'transient'], ['rate_limited', 'transient']],
   ]) {
-    const accounts = Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
+    const accounts = Array.from({ length: 4 }, (_, i) => ({ generation: 'synthetic', id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
     const stage = rotationStage({ accounts });
     const { error, calls } = await stage.request([
       ...outcomes.map((outcome) => responses[outcome]),
@@ -233,7 +233,7 @@ test('unknown, protocol and transient failures share one two-attempt failed-acco
 });
 
 test('an all-429 shared-budget stop stays 429, while a mixed stop is an explicit service failure', async () => {
-  const accounts = Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, email: `mix${i}@example.com`, projectId: 'p' }));
+  const accounts = Array.from({ length: 4 }, (_, i) => ({ generation: 'synthetic', id: `a${i}`, email: `mix${i}@example.com`, projectId: 'p' }));
   const rateLimited = () => sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]);
   const all429 = rotationStage({ accounts });
   const first = await all429.request([rateLimited, rateLimited, rateLimited]);
@@ -251,8 +251,8 @@ test('an all-429 shared-budget stop stays 429, while a mixed stop is an explicit
 
 test('a spent pool keeps the real protocol failure instead of a fabricated quota 429', async () => {
   const accounts = [
-    { id: 'a0', email: 'pool0@example.com', projectId: 'p' },
-    { id: 'a1', email: 'pool1@example.com', projectId: 'p' },
+    { generation: 'synthetic', id: 'a0', email: 'pool0@example.com', projectId: 'p' },
+    { generation: 'synthetic', id: 'a1', email: 'pool1@example.com', projectId: 'p' },
   ];
   const stage = rotationStage({ accounts });
   stage.pool.restrict({

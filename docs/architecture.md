@@ -163,7 +163,12 @@ the antigravity IDE and CLIProxyAPI actually use) accepts the same shape with
   again. normal refresh increments a token version but not the generation.
 - shared refresh singleflight is keyed by account+generation. a stale finally
   cannot delete a newer entry, and a late old-generation result cannot replace
-  a newer cached token. cache write ordering uses monotonic operation versions, including when
+  a newer cached token. the CLI supplies an authoritative generation lookup from CredentialStore;
+  token/project preparation checks it before provider work and again after asynchronous body reads,
+  immediately before cache writes. stale snapshots are rejected even if they start after newer
+  work; missing/failed lookup returns a typed503 without using cached tokens or writing state.
+  the store still uses lastGood during partial file rewrites. cache write ordering additionally
+  uses monotonic operation versions, including when
   refreshes complete within the same millisecond. a same-path replacement detected during preparation
   reloads that credential snapshot once without adding credentials or resetting dispatch budgets.
 - only an exact top-level `error: "invalid_grant"` from the token endpoint is

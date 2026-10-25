@@ -12,7 +12,7 @@ import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { accountLabel } from '../src/utils/alias.js';
 import { CredentialStore } from '../src/credentials/credential-store.js';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { failureReason, handleWithRotation } from '../src/server/handlers.js';
 import { createServer } from '../src/server/create-server.js';
@@ -52,7 +52,7 @@ async function startRelay({ accounts, respond, logger }) {
     rotation: { ...CONFIG.rotation, cooldownMs: 45_000, requestDeadlineMs: 5000 },
     fallback: { enabled: false },
   };
-  const client = new UpstreamClient({ config, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   client.accessToken = async () => 'SENTINEL_ACCESS_TOKEN';
   const server = createServer({ config, credentialStore: { readAll: () => accounts }, upstream: client, pool: new AccountPool({ logger }), logger });
   await once(server.listen(0), 'listening');
@@ -72,6 +72,7 @@ async function chat(port, content = 'SENTINEL_PROMPT_TEXT') {
 }
 
 const ACCOUNT = {
+  generation: 'synthetic',
   id: '/home/sentinel/.config/creds/sentinel-token.json',
   email: 'sentinel@example.test',
   projectId: 'SENTINEL_PROJECT_ID',
@@ -173,15 +174,15 @@ test('a refusal is journaled as a boolean, its text stays in the client response
 
 test('the refresh and project paths journal the alias, never the token, email or project id', async () => {
   const sink = journal();
-  const client = new UpstreamClient({ config: CONFIG, logger: sink.logger });
-  const account = { id: '/home/sentinel/token.json', email: 'sentinel@example.test', refreshToken: 'SENTINEL_REFRESH_TOKEN' };
+  const client = new UpstreamClient({ currentGeneration: generationOf, config: CONFIG, logger: sink.logger });
+  const account = { generation: 'synthetic', id: '/home/sentinel/token.json', email: 'sentinel@example.test', refreshToken: 'SENTINEL_REFRESH_TOKEN' };
   const token = await client.accessToken(account, {
     fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'SENTINEL_ACCESS_TOKEN', expires_in: 3600 }) }),
   });
   assert.equal(token, 'SENTINEL_ACCESS_TOKEN');
   client.request = async () => ({ ok: true, json: async () => ({ cloudaicompanionProject: 'SENTINEL_PROJECT_ID' }) });
   client.accessToken = async () => 'SENTINEL_ACCESS_TOKEN';
-  assert.equal(await client.ensureProject({ id: '/home/sentinel/token.json', email: 'sentinel@example.test' }), 'SENTINEL_PROJECT_ID');
+  assert.equal(await client.ensureProject({ generation: 'synthetic', id: '/home/sentinel/token.json', email: 'sentinel@example.test' }), 'SENTINEL_PROJECT_ID');
   const text = sink.text();
   assert.match(text, /oauth\.refreshed/);
   assert.match(text, /project\.resolved/);

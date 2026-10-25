@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 import { accountLabel } from '../src/utils/alias.js';
 import { createServer } from '../src/server/create-server.js';
 import { handleWithRotation } from '../src/server/handlers.js';
@@ -13,8 +13,8 @@ import { handleWithRotation } from '../src/server/handlers.js';
 const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 const ACCOUNTS = [
-  { id: 'a0', email: 'first@example.com' },
-  { id: 'a1', email: 'second@example.com' },
+  { generation: 'synthetic', id: 'a0', email: 'first@example.com' },
+  { generation: 'synthetic', id: 'a1', email: 'second@example.com' },
 ];
 const CONFIG_NO_FALLBACK = {
   apiKey: null,
@@ -313,7 +313,7 @@ test('the native vision lane still answers with the google-native body, untouche
     },
   };
   const calls = [];
-  const upstream = new UpstreamClient({
+  const upstream = new UpstreamClient({ currentGeneration: generationOf,
     config: { ...CONFIG, upstream: { ...CONFIG.upstream, baseUrl: 'http://127.0.0.1:1', egress: { url: null } } },
     logger,
   });
@@ -324,7 +324,7 @@ test('the native vision lane still answers with the google-native body, untouche
   };
   const server = createServer({
     config: { ...CONFIG, fallback: { enabled: false } },
-    credentialStore: { readAll: () => [{ id: 'a0', projectId: 'p' }] },
+    credentialStore: { readAll: () => [{ generation: 'synthetic', id: 'a0', projectId: 'p' }] },
     upstream,
     pool: new AccountPool({ logger }),
     logger,
@@ -361,7 +361,7 @@ test('the streaming lane turns an upstream error frame into an error frame, not 
     });
   });
   await once(upstreamServer.listen(0), 'listening');
-  const client = new UpstreamClient({
+  const client = new UpstreamClient({ currentGeneration: generationOf,
     config: {
       ...CONFIG,
       upstream: { ...CONFIG.upstream, baseUrl: `http://127.0.0.1:${upstreamServer.address().port}`, apiVersion: 'v1internal', requestTimeoutMs: 2000, egress: { url: null } },
@@ -371,7 +371,7 @@ test('the streaming lane turns an upstream error frame into an error frame, not 
   client.accessToken = async () => 'test-token';
   const server = createServer({
     config: { ...CONFIG, fallback: { enabled: false } },
-    credentialStore: { readAll: () => [{ id: 'a0', projectId: 'p' }] },
+    credentialStore: { readAll: () => [{ generation: 'synthetic', id: 'a0', projectId: 'p' }] },
     upstream: client,
     pool: new AccountPool({ logger }),
     logger,

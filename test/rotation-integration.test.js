@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { accountLabel } from '../src/utils/alias.js';
@@ -111,7 +111,7 @@ async function startStack({
     },
     fallback: { enabled: false, ...fallback },
   };
-  const client = givenClient ?? new UpstreamClient({ config, logger });
+  const client = givenClient ?? new UpstreamClient({ currentGeneration: generationOf, config, logger });
   if (!givenClient) client.accessToken = accessToken ?? (async (account) => tokenFor(account));
   const pool = new AccountPool({ logger });
   const store = { readAll: () => accounts.map((account) => ({ ...account })) };

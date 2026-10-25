@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 import { createDispatchBudget } from '../src/upstream/dispatch-budget.js';
 import { CredentialStore, materialGeneration } from '../src/credentials/credential-store.js';
 import { EgressError } from '../src/upstream/egress.js';
@@ -23,7 +23,7 @@ const CONFIG = {
 };
 
 function client(config = CONFIG) {
-  return new UpstreamClient({ config, logger });
+  return new UpstreamClient({ currentGeneration: generationOf, config, logger });
 }
 
 function account(generation, refreshToken = `refresh-${generation}`) {

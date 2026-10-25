@@ -5,7 +5,7 @@ import net from 'node:net';
 import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { accountLabel } from '../src/utils/alias.js';
@@ -47,7 +47,7 @@ function fakeVertex() {
 }
 
 test('an already cancelled request starts no credential or body preparation', async () => {
-  const client = new UpstreamClient({ config: CONFIG, logger: createLogger('error') });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config: CONFIG, logger: createLogger('error') });
   let preparationCalls = 0;
   client.accessToken = async () => { preparationCalls++; return 'synthetic-token'; };
   client.buildBody = async () => { preparationCalls++; return {}; };
@@ -63,8 +63,8 @@ test('an already cancelled request starts no credential or body preparation', as
 test('a caller that hangs up while the answer is pending cancels the upstream and cools no account', async () => {
   const { logger, events } = recorder();
   const accounts = [
-    { id: 'a0', email: 'first@example.com', projectId: 'p' },
-    { id: 'a1', email: 'second@example.com', projectId: 'p' },
+    { generation: 'synthetic', id: 'a0', email: 'first@example.com', projectId: 'p' },
+    { generation: 'synthetic', id: 'a1', email: 'second@example.com', projectId: 'p' },
   ];
   const vertex = fakeVertex();
   await once(vertex.server.listen(0), 'listening');
@@ -146,7 +146,7 @@ test('a caller that hangs up mid-upload never reaches the upstream and leaves th
   };
   const server = createServer({
     config: { ...CONFIG, fallback: { enabled: false } },
-    credentialStore: { readAll: () => [{ id: 'a0', projectId: 'p' }] },
+    credentialStore: { readAll: () => [{ generation: 'synthetic', id: 'a0', projectId: 'p' }] },
     upstream,
     pool: new AccountPool({ logger }),
     logger,
@@ -190,14 +190,14 @@ test('a cancelled caller does not cancel the shared token refresh of another cal
       egress: { url: null },
     },
   };
-  const client = new UpstreamClient({ config, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   let refreshes = 0;
   const oauthFetch = async () => {
     refreshes += 1;
     await new Promise((resolve) => setTimeout(resolve, 120));
     return { ok: true, status: 200, json: async () => ({ access_token: 'fresh-token', expires_in: 3600 }) };
   };
-  const account = { id: 'shared', email: 'person@example.com', projectId: 'p', refreshToken: 'refresh', expiry: null };
+  const account = { generation: 'synthetic', id: 'shared', email: 'person@example.com', projectId: 'p', refreshToken: 'refresh', expiry: null };
   const openAiBody = { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] };
   const leaving = new AbortController();
   try {

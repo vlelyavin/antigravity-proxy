@@ -10,7 +10,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { makeEgressAgent } from '../src/upstream/egress.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { handleWithRotation } from '../src/server/handlers.js';
@@ -21,8 +21,8 @@ const KEY = fs.readFileSync(new URL('./fixtures/localhost-test-key.pem', import.
 const CERT = fs.readFileSync(new URL('./fixtures/localhost-test-cert.pem', import.meta.url));
 
 const BODY = { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'synthetic' }] };
-const ACCOUNT = { id: 'a0', email: 'first@example.com', projectId: 'p' };
-const ACCOUNTS = [ACCOUNT, { id: 'a1', email: 'second@example.com', projectId: 'p' }];
+const ACCOUNT = { generation: 'synthetic', id: 'a0', email: 'first@example.com', projectId: 'p' };
+const ACCOUNTS = [ACCOUNT, { generation: 'synthetic', id: 'a1', email: 'second@example.com', projectId: 'p' }];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -113,7 +113,7 @@ async function startConnector({ mode = 'ok', egressUrl: given } = {}) {
     rotation: { ...CONFIG.rotation, cooldownMs: 45_000, requestDeadlineMs: 5000 },
     fallback: { enabled: false },
   };
-  const client = new UpstreamClient({ config, logger });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   client.accessToken = async () => 'synthetic-token';
   // the only test hook: a trust anchor for the committed self-signed certificate
   client.agentFor = () => makeEgressAgent({ egressUrl, tlsOptions: { ca: CERT } });

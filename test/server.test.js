@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { CredentialStore } from '../src/credentials/credential-store.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 
@@ -54,7 +54,7 @@ async function startStack({ accounts, apiKey = null } = {}) {
     apiKey,
   };
   // stub refresh: access token comes back as 'test-token'
-  const upstreamClient = new UpstreamClient({ config, logger });
+  const upstreamClient = new UpstreamClient({ currentGeneration: generationOf, config, logger });
   upstreamClient.accessToken = async () => 'test-token';
 
   const pool = new AccountPool({ logger });
@@ -74,7 +74,7 @@ async function post(port, path, body, headers = {}) {
 }
 
 test('non-stream chat completion round-trips through the fake upstream', async () => {
-  const stack = await startStack({ accounts: [{ id: 'f1', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }] });
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'f1', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }] });
   try {
     const res = await post(stack.port, '/v1/chat/completions', { model: 'gemini-3.8-flash-high', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);
@@ -87,7 +87,7 @@ test('non-stream chat completion round-trips through the fake upstream', async (
 });
 
 test('stream chat completion emits OpenAI SSE chunks + [DONE]', async () => {
-  const stack = await startStack({ accounts: [{ id: 'f2', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }] });
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'f2', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }] });
   try {
     const res = await post(stack.port, '/v1/chat/completions', { model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);
@@ -105,8 +105,8 @@ test('stream chat completion emits OpenAI SSE chunks + [DONE]', async () => {
 test('429 rotates to the second account', async () => {
   const stack = await startStack({
     accounts: [
-      { id: 'q1', email: 'dead@x', projectId: 'p-exhausted', refreshToken: 'r', accessToken: 't', expiry: null },
-      { id: 'q2', email: 'alive@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null },
+      { generation: 'synthetic', id: 'q1', email: 'dead@x', projectId: 'p-exhausted', refreshToken: 'r', accessToken: 't', expiry: null },
+      { generation: 'synthetic', id: 'q2', email: 'alive@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null },
     ],
   });
   try {
@@ -116,7 +116,7 @@ test('429 rotates to the second account', async () => {
     const json = await res.json();
     assert.equal(json.choices[0].message.content, 'hey');
     // the bare 429 stays request-local: no shared account cooldown
-    assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q1', 'q2']);
+    assert.deepEqual(stack.pool.healthy([{ generation: 'synthetic', id: 'q1' }, { generation: 'synthetic', id: 'q2' }]).map((a) => a.id), ['q1', 'q2']);
     const exhausted = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'TRIGGER_429' }] });
     assert.equal(exhausted.status, 429);
   } finally {
@@ -125,7 +125,7 @@ test('429 rotates to the second account', async () => {
 });
 
 test('api key enforced when configured', async () => {
-  const stack = await startStack({ accounts: [{ id: 'k1', projectId: 'p' }], apiKey: 'sk-secret' });
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'k1', projectId: 'p' }], apiKey: 'sk-secret' });
   try {
     const noKey = await post(stack.port, '/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(noKey.status, 401);
@@ -139,7 +139,7 @@ test('api key enforced when configured', async () => {
 });
 
 test('/health reports accounts; /v1/models lists catalog', async () => {
-  const stack = await startStack({ accounts: [{ id: 'h1', email: 'e@x', projectId: 'p' }] });
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'h1', email: 'e@x', projectId: 'p' }] });
   try {
     const health = await fetch(`http://127.0.0.1:${stack.port}/health`);
     const healthJson = await health.json();

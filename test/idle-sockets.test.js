@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { dropIdleSockets, makeEgressAgent } from '../src/upstream/egress.js';
 import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
-import { UpstreamClient } from '../src/upstream/upstream-client.js';
+import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js';
 
 // socks5 relay (no auth): answers the handshake, then pipes to the requested target
 function relaySocks5() {
@@ -139,7 +139,7 @@ test('dropIdleSockets closes pooled sockets and leaves in-flight ones', async ()
 
 test('a pre-flight network failure retries after dropping pooled sockets', async () => {
   const config = loadConfig({ env: { ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
-  const client = new UpstreamClient({ config, logger: createLogger('error') });
+  const client = new UpstreamClient({ currentGeneration: generationOf, config, logger: createLogger('error') });
   const order = [];
   client.agents.set('socks5://egress', { freeSockets: { 'upstream:443:': [{ destroy: () => order.push('drop') }] } });
   client.accessToken = async () => 'token';
@@ -151,7 +151,7 @@ test('a pre-flight network failure retries after dropping pooled sockets', async
     if (calls === 1) throw new Error('socket hang up');
     return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
   };
-  const response = await client.generate({ openAiBody: { model: 'gemini-3.8-flash-low' }, account: { id: 'a', projectId: 'p' } });
+  const response = await client.generate({ openAiBody: { model: 'gemini-3.8-flash-low' }, account: { generation: 'synthetic', id: 'a', projectId: 'p' } });
   assert.equal(response.status, 200);
   assert.deepEqual(order, ['request1', 'drop', 'request2']);
 });
