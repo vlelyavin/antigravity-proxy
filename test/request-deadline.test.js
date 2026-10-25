@@ -7,6 +7,7 @@ import { createLogger } from '../src/utils/logger.js';
 import { UpstreamClient } from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
+import { accountLabel } from '../src/utils/alias.js';
 
 const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
@@ -110,7 +111,7 @@ test('the request deadline bounds a hanging pool and cools no account', async ()
     const attempt = stack.events.find((e) => e.event === 'attempt.timing');
     assert.equal(attempt.outcome, 'deadline');
     assert.equal(attempt.status, 504);
-    assert.equal(attempt.account, 'acct-0');
+    assert.equal(attempt.account, accountLabel(ACCOUNTS[0]));
     const request = stack.events.find((e) => e.event === 'request.timing');
     assert.equal(request.outcome, 'deadline');
     assert.equal(request.attempts, 1);
@@ -179,7 +180,7 @@ test('timings carry the request id and an anonymised account, never the email', 
     assert.equal(typeof request.reason, 'string');
     const attempt = stack.events.find((e) => e.event === 'attempt.timing');
     for (const field of ['prepMs', 'firstFrameMs', 'totalMs']) assert.ok(field in attempt, `attempt.timing lacks ${field}`);
-    assert.equal(attempt.account, 'acct-0');
+    assert.equal(attempt.account, accountLabel(ACCOUNTS[0]));
     const timingLines = stack.events.filter((e) => /^attempt\.timing$|^request\.timing$/.test(e.event));
     assert.ok(timingLines.length >= 2);
     assert.ok(!JSON.stringify(timingLines).includes('@example.com'), 'the timing lines never carry an account email');

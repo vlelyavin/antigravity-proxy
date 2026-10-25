@@ -1,6 +1,7 @@
 import { antigravityToOpenAi, antigravityChunkToOpenAiChunk } from '../rewrite/openai-translate.js';
 import { abortFailure, UpstreamError, upstreamErrorFromJson } from '../upstream/upstream-client.js';
 import { generateViaVertexFallback, isGeminiFamily, openAiJsonToStreamFrames } from '../upstream/vertex-fallback.js';
+import { accountLabel } from '../utils/alias.js';
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
@@ -32,6 +33,11 @@ export function errorResponse(res, status, message, type = 'invalid_request_erro
 // only shortens a single attempt inside this budget; it can never extend the request.
 const DEFAULT_REQUEST_DEADLINE_MS = 110_000;
 const MAX_REQUEST_DEADLINE_MS = 600_000;
+// Flow-aware attempt caps: the wait for the first meaningful frame, then the gap between meaningful
+// frames. They bound a socket the upstream holds open without progress; they never buy an attempt
+// more time on the absolute ladder or on the request budget.
+const DEFAULT_FIRST_MEANINGFUL_FRAME_MS = 45_000;
+const DEFAULT_IDLE_MS = 30_000;
 
 export function resolveRequestDeadlineMs(config) {
   const configured = config?.rotation?.requestDeadlineMs;
@@ -39,20 +45,21 @@ export function resolveRequestDeadlineMs(config) {
   return Math.min(configured, MAX_REQUEST_DEADLINE_MS);
 }
 
+/** rotation.firstMeaningfulFrameTimeoutMs / rotation.idleTimeoutMs, with a positive-value guard. */
+export function resolveFlowTimeouts(config) {
+  const rotation = config?.rotation ?? {};
+  const positive = (value, fallback) => (Number.isFinite(value) && value > 0 ? value : fallback);
+  return {
+    firstMeaningfulFrameMs: positive(rotation.firstMeaningfulFrameTimeoutMs, DEFAULT_FIRST_MEANINGFUL_FRAME_MS),
+    idleMs: positive(rotation.idleTimeoutMs, DEFAULT_IDLE_MS),
+  };
+}
+
 /** The i-th attempt's own cap; without a ladder only the request deadline bounds an attempt. */
 function attemptCapMs(attemptTimeoutsMs, attempt) {
   if (!Array.isArray(attemptTimeoutsMs) || attemptTimeoutsMs.length === 0) return Infinity;
   const value = attemptTimeoutsMs[Math.min(attempt, attemptTimeoutsMs.length - 1)];
   return Number.isFinite(value) && value > 0 ? value : Infinity;
-}
-
-/**
- * Anonymised account handle for the journal: its index in credential order (the startup
- * credentials.loaded line prints the same order). Never the email.
- */
-function accountAlias(accounts, account) {
-  const index = accounts.indexOf(account);
-  return index === -1 ? 'acct-?' : `acct-${index}`;
 }
 
 /** A caller-supplied id is correlation sugar only: short, printable, no control characters. */
@@ -65,8 +72,11 @@ function requestIdFor(req) {
   return `req-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
-/** Short, payload-free failure classification for the journal: never an upstream message body. */
-function failureReason(error) {
+/**
+ * Payload-free failure classification for the journal: a structured kind and status, never an
+ * upstream message body (those echo prompts), never a token, path or email.
+ */
+export function failureReason(error) {
   if (!error) return null;
   if (error instanceof UpstreamError) return `${error.kind}:${error.status}`;
   if (typeof error.code === 'string') return error.code;
@@ -81,6 +91,98 @@ function deadlineError(deadlineMs) {
   return new UpstreamError(`request deadline of ${deadlineMs}ms exceeded`, { status: 504, kind: 'deadline' });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Terminal outcome of one generation.
+//
+// The translate layer maps a finish reason to the OpenAI one and defaults an unknown value to
+// `stop`. At this boundary that default is not acceptable: a generation only ends successfully with
+// a documented terminal outcome, and anything else (MALFORMED_FUNCTION_CALL, LANGUAGE, OTHER, the
+// IMAGE_* reasons, an unspecified or an unknown value) becomes an explicit protocol failure instead
+// of a fabricated success. The mapping itself stays in the translate module, untouched.
+// ---------------------------------------------------------------------------------------------
+const SUCCESSFUL_TERMINALS = new Set([
+  'STOP', // completed: openai `stop`
+  'MAX_TOKENS', // completed, cut by the output budget: openai `length`
+  'SAFETY', // refusal: openai `content_filter`
+  'RECITATION',
+  'BLOCKLIST',
+  'PROHIBITED_CONTENT',
+  'SPII',
+]);
+
+/** Is this upstream finish reason a documented end of a generation for the caller? */
+export function isSuccessfulTerminal(finishReason) {
+  return typeof finishReason === 'string' && SUCCESSFUL_TERMINALS.has(finishReason);
+}
+
+/** The raw upstream finishReason of an antigravity frame, or null when the frame carries none. */
+function rawFinishReason(frame) {
+  const wrapper = frame?.response ?? frame;
+  const reason = wrapper?.candidates?.[0]?.finishReason;
+  return typeof reason === 'string' && reason !== '' ? reason : null;
+}
+
+function unsuccessfulTerminal(accountId, finishReason) {
+  return new UpstreamError(`upstream finished with an unsuccessful finish reason: ${finishReason}`, {
+    status: 502, accountId, kind: 'terminal',
+  });
+}
+
+/**
+ * Real generation progress: text, thinking, a tool call, a refusal or an explicit terminal. Empty
+ * candidates, keepalives and role-only deltas are none of those - they keep the socket warm and
+ * nothing else.
+ */
+export function isMeaningfulChunk(chunk) {
+  const choice = chunk?.choices?.[0];
+  if (!choice) return false;
+  const delta = choice.delta ?? {};
+  return (typeof delta.content === 'string' && delta.content !== '')
+    || (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '')
+    || (typeof delta.tool_calls === 'object' && delta.tool_calls !== null && delta.tool_calls.length > 0)
+    || (typeof delta.refusal === 'string' && delta.refusal !== '')
+    || Boolean(choice.finish_reason);
+}
+
+/**
+ * The two flow-aware timers of one attempt. `progress()` is called on every meaningful chunk: it
+ * clears the first-frame wait and re-arms the idle wait. Nothing here touches the request deadline
+ * or the explicit ladder, so a flowing answer can never extend either. `dispose()` must run when the
+ * attempt ends: it leaves no timer behind.
+ */
+export function createFlowWatchdog({ firstMeaningfulFrameMs, idleMs, onStall }) {
+  let satisfied = false;
+  let idleTimer = null;
+  let firstTimer = null;
+  const clearIdle = () => {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  };
+  if (Number.isFinite(firstMeaningfulFrameMs) && firstMeaningfulFrameMs > 0) {
+    firstTimer = setTimeout(() => {
+      firstTimer = null;
+      if (!satisfied) onStall('first_frame_timeout', firstMeaningfulFrameMs);
+    }, firstMeaningfulFrameMs);
+  }
+  return {
+    get satisfied() { return satisfied; },
+    progress() {
+      satisfied = true;
+      if (firstTimer) { clearTimeout(firstTimer); firstTimer = null; }
+      clearIdle();
+      if (Number.isFinite(idleMs) && idleMs > 0) {
+        idleTimer = setTimeout(() => {
+          idleTimer = null;
+          onStall('idle_timeout', idleMs);
+        }, idleMs);
+      }
+    },
+    dispose() {
+      if (firstTimer) { clearTimeout(firstTimer); firstTimer = null; }
+      clearIdle();
+    },
+  };
+}
+
 /**
  * Runs an OpenAI-shaped request through the pool with rotation on quota/auth.
  * attemptTimeoutsMs (header x-attempt-timeouts-ms, non-stream only): the i-th account attempt is
@@ -88,11 +190,15 @@ function deadlineError(deadlineMs) {
  * deadline; the request then moves on to the next account and, once the pool is spent, the Vertex
  * relay answers inside the same budget. A caller that disconnects, or a spent deadline, is not an
  * upstream failure: the account is not cooled down and no further attempt starts.
+ * The flow timers (rotation.firstMeaningfulFrameTimeoutMs / rotation.idleTimeoutMs) cut an attempt
+ * that holds its socket open without progress; they rotate only while nothing has been written to
+ * the caller, because a started client stream can never receive another account's output.
  */
 export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal, respondNative = false, attemptTimeoutsMs = [] }) {
   const requestId = requestIdFor(req);
   const startedAt = Date.now();
   const deadlineMs = resolveRequestDeadlineMs(config);
+  const flowTimeouts = resolveFlowTimeouts(config);
   const deadlineAt = startedAt + deadlineMs;
   const deadlineReached = new AbortController();
   const deadlineTimer = setTimeout(() => {
@@ -149,38 +255,71 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
         : null;
       const attemptSignal = attemptAbort.signal;
       const timing = { startedAt: attemptStartedAt, prepMs: null, firstFrameMs: null };
+      // The flow watchdog exists where there is a frame stream to measure: the client SSE lane and
+      // the SSE collection of a non-stream request. Native buffered generateContent has no frames,
+      // so it keeps only the ladder and the total budget (see README, "native lane").
+      const flow = respondNative === true ? null : createFlowWatchdog({
+        firstMeaningfulFrameMs: flowTimeouts.firstMeaningfulFrameMs,
+        idleMs: flowTimeouts.idleMs,
+        onStall: (code, timeoutMs) => attemptAbort.abort(Object.assign(
+          new Error(code === 'first_frame_timeout'
+            ? `upstream sent no meaningful frame within ${timeoutMs}ms`
+            : `upstream stalled for ${timeoutMs}ms after making progress`),
+          { code },
+        )),
+      });
       let attemptOutcome = 'error';
       let retry = false;
+      let abortCode = null;
       try {
         if (openAiBody.stream) {
-          await handleStream({ upstream, config, logger, account, openAiBody, res, signal: attemptSignal, timing });
+          await handleStream({ upstream, config, logger, account, openAiBody, res, signal: attemptSignal, timing, flow, requestId });
         } else {
-          await handleNonStream({ upstream, config, logger, account, openAiBody, res, signal: attemptSignal, respondNative, timing });
+          await handleNonStream({ upstream, logger, account, openAiBody, res, signal: attemptSignal, respondNative, timing, flow, requestId });
         }
         attemptOutcome = 'ok';
       } catch (error) {
         lastError = error;
+        abortCode = attemptAbort.signal.aborted && typeof attemptAbort.signal.reason?.code === 'string'
+          ? attemptAbort.signal.reason.code
+          : null;
         if (clientGone()) {
           // the caller hung up: nothing to cool down and nobody left to answer
           attemptOutcome = 'client_abort';
         } else if (outOfTime()) {
           attemptOutcome = 'deadline';
           lastError = deadlineError(deadlineMs);
+        } else if (error?.reported === true) {
+          // the client stream already carries the failure frame: nothing may be appended to it and
+          // no other account's output may be mixed into it
+          attemptOutcome = 'stream_failed';
+        } else if (abortCode === 'first_frame_timeout' || abortCode === 'idle_timeout') {
+          // flow-aware cut: the upstream held its socket open without progress
+          attemptOutcome = abortCode;
+          const timeoutMs = abortCode === 'first_frame_timeout' ? flowTimeouts.firstMeaningfulFrameMs : flowTimeouts.idleMs;
+          lastError = new UpstreamError(
+            abortCode === 'first_frame_timeout'
+              ? `upstream sent no meaningful frame within ${timeoutMs}ms`
+              : `upstream stalled for ${timeoutMs}ms after making progress`,
+            { status: 504, accountId: account.id, kind: 'timeout' },
+          );
+          // the next account may answer only while the caller has received nothing yet
+          retry = !res.headersSent;
         } else if (attemptAbort.signal.aborted) {
           // a hung upstream: the next untried account gets the rest of the client's patience
           attemptOutcome = 'attempt_timeout';
           lastError = new UpstreamError(`upstream attempt timed out after ${attemptMs}ms`, { status: 504, accountId: account.id, kind: 'timeout' });
-          logger.warn('rotation.attempt_timeout', { account: account.email || account.id, attempt, timeoutMs: attemptMs });
+          logger.warn('rotation.attempt_timeout', { requestId, account: accountLabel(account), attempt, timeoutMs: attemptMs });
           retry = true;
         } else if (error instanceof UpstreamError && error.kind === 'quota') {
           attemptOutcome = 'quota';
-          pool.cooldown(account.id, config.rotation.cooldownMs);
-          logger.warn('rotation.quota', { account: account.email || account.id, attempt });
+          pool.cooldown(account.id, config.rotation.cooldownMs, accountLabel(account));
+          logger.warn('rotation.quota', { requestId, account: accountLabel(account), attempt });
           retry = true;
         } else if (error instanceof UpstreamError && error.kind === 'auth') {
           attemptOutcome = 'auth';
           upstream.invalidate(account.id);
-          logger.warn('rotation.auth', { account: account.email || account.id, attempt });
+          logger.warn('rotation.auth', { requestId, account: accountLabel(account), attempt });
           retry = true;
         } else if (error instanceof UpstreamError && (error.status === 502 || error.status === 504) && !res.headersSent) {
           // 2026-10-17: transient lane/proxy failures (502/504 before any bytes were written)
@@ -188,21 +327,34 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
           // A dead Mullvad lane on the sticky account otherwise aborts every request for
           // the whole cooldown window.
           attemptOutcome = 'transient';
-          pool.cooldown(account.id, Math.min(config.rotation.cooldownMs, 60_000));
+          pool.cooldown(account.id, Math.min(config.rotation.cooldownMs, 60_000), accountLabel(account));
           logger.warn('rotation.transient', {
-            account: account.email || account.id, attempt, status: error.status, message: error.message,
+            requestId, account: accountLabel(account), attempt, status: error.status,
           });
           retry = true;
         }
       } finally {
+        flow?.dispose();
         requestSignal.removeEventListener('abort', forwardAbort);
         if (attemptTimer) clearTimeout(attemptTimer);
+      }
+      // a flow stall is one category whether or not it could still rotate
+      if ((attemptOutcome === abortCode || attemptOutcome === 'stream_failed')
+        && (abortCode === 'first_frame_timeout' || abortCode === 'idle_timeout')) {
+        logger.warn('rotation.stall', {
+          requestId,
+          account: accountLabel(account),
+          attempt,
+          kind: abortCode,
+          timeoutMs: abortCode === 'first_frame_timeout' ? flowTimeouts.firstMeaningfulFrameMs : flowTimeouts.idleMs,
+          rotatable: attemptOutcome === abortCode,
+        });
       }
       status = attemptOutcome === 'ok' ? 200 : (attemptOutcome === 'client_abort' ? null : (lastError instanceof UpstreamError ? lastError.status : 502));
       logger.info('attempt.timing', {
         requestId,
         attempt,
-        account: accountAlias(accounts, account),
+        account: accountLabel(account),
         stream: openAiBody.stream === true,
         outcome: attemptOutcome,
         status,
@@ -218,7 +370,7 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
 
     // Pool exhausted: last-resort Vertex relay before giving up, inside the same budget.
     if (!clientGone() && !outOfTime()
-      && await tryVertexFallback({ config, logger, openAiBody, res, signal: requestSignal, deadlineAt, respondNative, lastError })) {
+      && await tryVertexFallback({ config, logger, openAiBody, res, signal: requestSignal, deadlineAt, respondNative, lastError, requestId })) {
       requestOutcome = 'vertex_fallback';
       status = 200;
       return;
@@ -246,7 +398,7 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
 }
 
 /** Last-resort relay to the local Vertex proxy when every antigravity account failed. */
-async function tryVertexFallback({ config, logger, openAiBody, res, signal, deadlineAt, respondNative, lastError }) {
+async function tryVertexFallback({ config, logger, openAiBody, res, signal, deadlineAt, respondNative, lastError, requestId }) {
   const fb = config.fallback;
   if (!fb?.enabled || !fb.vertexUrl || respondNative || res.headersSent) return false;
   if (!isGeminiFamily(openAiBody.model)) return false;
@@ -254,7 +406,7 @@ async function tryVertexFallback({ config, logger, openAiBody, res, signal, dead
   const remainingMs = deadlineAt - Date.now();
   if (!(remainingMs > 0)) return false;
   const timeoutMs = Math.min(Number.isFinite(fb.timeoutMs) && fb.timeoutMs > 0 ? fb.timeoutMs : remainingMs, remainingMs);
-  logger.warn('vertex_fallback.attempt', { model: openAiBody.model, poolError: lastError?.message });
+  logger.warn('vertex_fallback.attempt', { requestId, model: openAiBody.model, poolError: failureReason(lastError) });
   try {
     const json = await generateViaVertexFallback({
       openAiBody, vertexUrl: fb.vertexUrl, timeoutMs, signal,
@@ -271,10 +423,10 @@ async function tryVertexFallback({ config, logger, openAiBody, res, signal, dead
       res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
       res.end(body);
     }
-    logger.warn('vertex_fallback.ok', { model: openAiBody.model });
+    logger.warn('vertex_fallback.ok', { requestId, model: openAiBody.model });
     return true;
   } catch (error) {
-    logger.warn('vertex_fallback.failed', { model: openAiBody.model, error: error.message });
+    logger.warn('vertex_fallback.failed', { requestId, model: openAiBody.model, reason: failureReason(error) });
     return false;
   }
 }
@@ -312,7 +464,7 @@ function truncatedCompletion(accountId) {
 // generateContent собирает ответ целиком и на длинных текстах выходит за
 // любой разумный таймаут, streamGenerateContent отдаёт те же данные первого
 // токена за секунды. Функция склеивает дельты в один completion.
-async function collectCompletion({ upstream, openAiBody, account, signal, model, timing }) {
+async function collectCompletion({ upstream, openAiBody, account, signal, model, timing, flow }) {
   const upstreamResponse = await upstream.generateStream({ openAiBody, account, signal });
   timing.prepMs = Date.now() - timing.startedAt;
   // апстрим иногда отвечает обычным JSON даже на sse-эндпоинт: не ломаемся.
@@ -326,7 +478,10 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     if (json?.error) throw upstreamErrorFromJson(json.error, account.id);
     const wrapper = json?.response ?? json;
     const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
-    if (!wrapper?.candidates?.[0]?.finishReason && !blocked) throw truncatedCompletion(account.id);
+    const terminal = rawFinishReason(json);
+    if (!terminal && !blocked) throw truncatedCompletion(account.id);
+    // a documented refusal or an explicit successful terminal, never the translate default
+    if (terminal && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
     return antigravityToOpenAi(json, { model });
   }
   const indexRef = { count: 0, first: true };
@@ -350,7 +505,11 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     if (frame?.error) throw upstreamErrorFromJson(frame.error, account.id);
     const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
     if (!out) return; // keepalive: no content, no finish reason, no refusal
-    timing.firstFrameMs ??= Date.now() - timing.startedAt;
+    if (isMeaningfulChunk(out)) {
+      // only real progress counts for the flow timers: a keepalive never satisfies the first wait
+      timing.firstFrameMs ??= Date.now() - timing.startedAt;
+      flow?.progress();
+    }
     id ??= out.id;
     if (out.usage) usage = out.usage;
     const choice = out.choices && out.choices[0];
@@ -370,7 +529,12 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
       toolCalls.set(call.index, slot);
     }
     // only an explicit terminal frame counts as the end of a generation
-    if (choice.finish_reason) finishReason = choice.finish_reason;
+    if (choice.finish_reason) {
+      const terminal = rawFinishReason(frame);
+      // an explicit but unsuccessful or unknown reason is not a successful end
+      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
+      finishReason = choice.finish_reason;
+    }
   };
 
   for await (const line of sseLines(upstreamResponse.body)) {
@@ -410,47 +574,41 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
   };
 }
 
-async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false, timing }) {
+async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false, timing, flow, requestId }) {
   if (!respondNative) {
-    const openAiJson = await collectCompletion({ upstream, openAiBody, account, signal, model: openAiBody.model, timing });
+    const openAiJson = await collectCompletion({ upstream, openAiBody, account, signal, model: openAiBody.model, timing, flow });
     const body = JSON.stringify(openAiJson);
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
     res.end(body);
     logger.info('chat.completed', {
+      requestId,
       model: openAiBody.model,
       effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
-      account: account.email || account.id,
+      account: accountLabel(account),
       promptTokens: openAiJson.usage.prompt_tokens,
       cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
       completionTokens: openAiJson.usage.completion_tokens,
-      ...(openAiJson.choices[0].message.refusal ? { blocked: openAiJson.choices[0].message.refusal } : {}),
+      blocked: Boolean(openAiJson.choices[0].message.refusal),
     });
     return;
   }
+  // Native buffered lane: generateContent, one JSON body, no frames to measure. The first-frame and
+  // idle timers deliberately do not apply here (nothing tells a JSON chunk from a keepalive); the
+  // legacy attempt ladder and the request budget are its only caps. See README.
   const upstreamResponse = await upstream.generate({ openAiBody, account, signal });
   timing.prepMs = Date.now() - timing.startedAt;
   const json = await upstreamResponse.json();
-  if (respondNative) {
-    const { antigravityToGeminiNative } = await import('../rewrite/gemini-native.js');
-    const nativeJson = antigravityToGeminiNative(json);
-    const body = JSON.stringify(nativeJson);
-    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-    res.end(body);
-    logger.info('native.completed', { model: openAiBody.model, effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null, account: account.email || account.id });
-    return;
-  }
-  const openAiJson = antigravityToOpenAi(json, { model: openAiBody.model });
-  const body = JSON.stringify(openAiJson);
+  const { antigravityToGeminiNative } = await import('../rewrite/gemini-native.js');
+  const nativeJson = antigravityToGeminiNative(json);
+  const body = JSON.stringify(nativeJson);
   res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
   res.end(body);
-  logger.info('chat.completed', {
+  logger.info('native.completed', {
+    requestId,
     model: openAiBody.model,
     effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
-    account: account.email || account.id,
-    promptTokens: openAiJson.usage.prompt_tokens,
-    cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
-    completionTokens: openAiJson.usage.completion_tokens,
-    ...(openAiJson.choices[0].message.refusal ? { blocked: openAiJson.choices[0].message.refusal } : {}),
+    account: accountLabel(account),
+    blocked: Boolean(nativeJson?.promptFeedback?.blockReason),
   });
 }
 
@@ -473,7 +631,27 @@ function drainOrAbort(res, signal) {
   });
 }
 
-async function handleStream({ upstream, logger, account, openAiBody, res, signal, timing }) {
+/**
+ * The client stream already carries the failure: it is reported to the caller of the attempt as a
+ * failure of the request, but it must not be appended to (no second account's output, no retry).
+ */
+function reportedStreamFailure(error, accountId) {
+  if (error instanceof UpstreamError) {
+    error.reported = true;
+    return error;
+  }
+  const code = typeof error?.code === 'string' ? error.code : null;
+  const timedOut = code === 'first_frame_timeout' || code === 'idle_timeout' || code === 'attempt_timeout' || code === 'request_deadline';
+  const wrapped = new UpstreamError(error?.message ?? 'upstream stream failed', {
+    status: timedOut ? 504 : 502,
+    accountId,
+    kind: code ?? 'stream',
+  });
+  wrapped.reported = true;
+  return wrapped;
+}
+
+async function handleStream({ upstream, logger, account, openAiBody, res, signal, timing, flow, requestId }) {
   const upstreamResponse = await upstream.generateStream({ openAiBody, account, signal });
   timing.prepMs = Date.now() - timing.startedAt;
   res.writeHead(200, {
@@ -486,7 +664,8 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
   // manual pump: stream/pipeline auto-destroys the destination on error,
   // which would swallow the error frame we want to send (H4)
   let failed = null;
-  let blocked = null;
+  let blocked = false;
+  let terminalSeen = false;
   try {
     for await (const line of sseLines(upstreamResponse.body)) {
       if (signal?.aborted) throw abortFailure(signal);
@@ -497,27 +676,46 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
       try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id); }
       // an explicit upstream error is a failure, not a quietly finished answer
       if (frame?.error) throw upstreamErrorFromJson(frame.error, account.id);
+      const terminal = rawFinishReason(frame);
+      // an unsuccessful or unknown terminal must never reach the client as a clean stop
+      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
       const openAiChunk = antigravityChunkToOpenAiChunk(frame, { model: openAiBody.model, indexRef });
       if (openAiChunk) {
-        timing.firstFrameMs ??= Date.now() - timing.startedAt;
-        blocked ??= openAiChunk.choices[0].delta.refusal ?? null;
+        if (isMeaningfulChunk(openAiChunk)) {
+          timing.firstFrameMs ??= Date.now() - timing.startedAt;
+          flow?.progress();
+        }
+        if (openAiChunk.choices[0].finish_reason) terminalSeen = true;
+        blocked ||= Boolean(openAiChunk.choices[0].delta?.refusal);
         if (!res.write(`data: ${JSON.stringify(openAiChunk)}\n\n`)) {
           await drainOrAbort(res, signal); // backpressure
         }
       }
     }
+    // A generation ends with an explicit terminal frame. A body that just stops must not be turned
+    // into a success-only [DONE]: the caller would take a truncated answer as a complete one.
+    if (!terminalSeen) throw truncatedCompletion(account.id);
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (error) {
     failed = error;
   }
   if (failed) {
-    logger.warn('stream.aborted', { error: failed.message });
+    logger.warn('stream.failed', {
+      requestId, model: openAiBody.model, account: accountLabel(account), reason: failureReason(failed),
+    });
     if (!res.writableEnded && !res.destroyed) {
       res.write(`data: ${JSON.stringify({ error: { message: `upstream stream failed: ${failed.message}`, type: 'server_error' } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
     }
+    throw reportedStreamFailure(failed, account.id);
   }
-  logger.info('chat.streamed', { model: openAiBody.model, effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null, account: account.email || account.id, ...(blocked ? { blocked } : {}) });
+  logger.info('chat.streamed', {
+    requestId,
+    model: openAiBody.model,
+    effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
+    account: accountLabel(account),
+    blocked,
+  });
 }

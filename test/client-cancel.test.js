@@ -8,6 +8,7 @@ import { createLogger } from '../src/utils/logger.js';
 import { UpstreamClient } from '../src/upstream/upstream-client.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
+import { accountLabel } from '../src/utils/alias.js';
 
 const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
@@ -123,7 +124,7 @@ test('a caller that hangs up while the answer is pending cancels the upstream an
     assert.ok(!events.some((e) => e.event === 'rotation.transient'));
     const attempt = events.find((e) => e.event === 'attempt.timing');
     assert.equal(attempt.outcome, 'client_abort');
-    assert.equal(attempt.account, 'acct-0');
+    assert.equal(attempt.account, accountLabel(accounts[0]));
   } finally {
     release();
     server.closeAllConnections();

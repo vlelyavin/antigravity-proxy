@@ -55,5 +55,13 @@ export const DEFAULTS = {
     // at 120 s, so the default sits just under it; raise it for callers that wait longer. The
     // per-attempt ladder (rotation.attemptTimeoutsMs) only shortens attempts inside this budget.
     requestDeadlineMs: 110_000,
+    // Flow-aware attempts (OpenAI SSE and the SSE collection of a non-stream request): how long an
+    // attempt may go without its FIRST meaningful frame (text, thinking, tool call, refusal or an
+    // explicit terminal), measured from the start of the attempt including preparation. Keepalives
+    // and role-only deltas do not count. A missing or non-positive value falls back to the default.
+    firstMeaningfulFrameTimeoutMs: 45_000,
+    // ...and how long it may then go between meaningful frames. Neither timer extends the request
+    // deadline or the explicit ladder, and the native generateContent lane has neither (no frames).
+    idleTimeoutMs: 30_000,
   },
 };

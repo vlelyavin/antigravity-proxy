@@ -9,5 +9,10 @@
       "~/.antigravity-proxy/accounts/*.json"
     ]
   },
-  "rotation": { "cooldownMs": 60000, "requestDeadlineMs": 110000 }
+  "rotation": {
+    "cooldownMs": 60000,
+    "requestDeadlineMs": 110000,
+    "firstMeaningfulFrameTimeoutMs": 45000,
+    "idleTimeoutMs": 30000
+  }
 }
