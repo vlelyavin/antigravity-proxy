@@ -52,7 +52,9 @@ function lane() {
   const server = https.createServer({ key: KEY, cert: CERT }, (req, res) => {
     state.requests += 1;
     req.resume();
-    req.on('close', () => { state.closed += 1; });
+    // IncomingMessage.close means the upload ended on Node >=16; response.close tracks
+    // the stalled response being torn down by cancellation.
+    res.on('close', () => { state.closed += 1; });
     res.on('error', () => {});
     req.on('end', () => {
       if (state.mode === 'never') return; // the caller waits for headers that never come
