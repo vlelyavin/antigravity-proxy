@@ -18,14 +18,47 @@ export class UpstreamError extends Error {
 /** Rejects once the signal aborts; the underlying work (a shared token refresh) keeps running. */
 function abortable(promise, signal) {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(new Error('aborted'));
+  if (signal.aborted) return Promise.reject(abortFailure(signal));
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(new Error('aborted'));
+    const onAbort = () => reject(abortFailure(signal));
     signal.addEventListener('abort', onAbort, { once: true });
     promise.then(
       (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
       (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
     );
+  });
+}
+
+/**
+ * The reason a signal fired (client disconnect, request deadline, attempt cap), so the caller can
+ * classify it instead of guessing from an error message. Falls back to a bare Error.
+ */
+export function abortFailure(signal) {
+  return signal?.reason instanceof Error ? signal.reason : new Error('aborted');
+}
+
+/**
+ * An explicit upstream error object (an SSE `{"error":…}` frame, or a JSON body) as the same
+ * structured UpstreamError the HTTP status path produces, so rotation keys off it identically.
+ */
+export function upstreamErrorFromJson(error, accountId = null) {
+  const status = Number.isInteger(error?.code) ? error.code : 502;
+  return upstreamErrorFrom(status, JSON.stringify({ error }), accountId);
+}
+
+export function upstreamErrorFrom(status, text, accountId) {
+  // structured kind (M10): rotation keys off this, never off message text
+  let kind = 'other';
+  let parsedStatus = null;
+  try {
+    parsedStatus = JSON.parse(text)?.error?.status ?? null;
+  } catch { /* not json */ }
+  if (status === 429 || parsedStatus === 'RESOURCE_EXHAUSTED') kind = 'quota';
+  else if (status === 401 || parsedStatus === 'UNAUTHENTICATED' || /invalid_grant/i.test(text)) kind = 'auth';
+  return new UpstreamError(`upstream ${status}: ${text.slice(0, 400)}`, {
+    status: status >= 500 ? 502 : status,
+    accountId,
+    kind,
   });
 }
 
@@ -235,6 +268,8 @@ export class UpstreamClient {
   }
 
   async #doFetch({ url, token, body, account, fetchImpl, signal, stream }) {
+    // a request cancelled before it started (client gone, deadline spent) never reaches the wire
+    if (signal?.aborted) throw abortFailure(signal);
     // enforce requestTimeoutMs (C2), combined with any client signal
     let combined = signal ?? null;
     if (typeof AbortSignal?.timeout === 'function') {
@@ -260,15 +295,18 @@ export class UpstreamClient {
       if (process.env.ANTIGRAVITY_DEBUG_BODY) {
         console.error('[debug-body] failing request payload:', payload.slice(0, 200000));
       }
-      throw this.#upstreamErrorFrom(response.status, text, account.id);
+      throw upstreamErrorFrom(response.status, text, account.id);
     } catch (error) {
       if (error instanceof UpstreamError) throw error;
+      if (signal?.aborted) throw abortFailure(signal);
       if (error.name === 'AbortError' || /aborted|timed? ?out/i.test(error.message)) {
         // timeout or client abort: do not retry
         throw new UpstreamError(`upstream timeout/abort: ${error.message}`, { status: 504, accountId: account.id, kind: 'other' });
       }
       preflightFailure = error;
     }
+    // the caller may have hung up while the first attempt was failing: do not re-POST for nobody
+    if (signal?.aborted) throw abortFailure(signal);
     // single pre-flight retry, on a fresh connection: the failed attempt most likely took a dead
     // pooled socket, and the pool can hold more of them (23.09 03:43: the retry hit one too)
     for (const agent of this.agents.values()) dropIdleSockets(agent);
@@ -276,26 +314,11 @@ export class UpstreamClient {
       const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
-      throw this.#upstreamErrorFrom(response.status, text, account.id);
+      throw upstreamErrorFrom(response.status, text, account.id);
     } catch (error) {
       if (error instanceof UpstreamError) throw error;
+      if (signal?.aborted) throw abortFailure(signal);
       throw new UpstreamError(`network error: ${preflightFailure?.message ?? error.message}`, { status: 502, accountId: account.id, kind: 'other' });
     }
-  }
-
-  #upstreamErrorFrom(status, text, accountId) {
-    // structured kind (M10): rotation keys off this, never off message text
-    let kind = 'other';
-    let parsedStatus = null;
-    try {
-      parsedStatus = JSON.parse(text)?.error?.status ?? null;
-    } catch { /* not json */ }
-    if (status === 429 || parsedStatus === 'RESOURCE_EXHAUSTED') kind = 'quota';
-    else if (status === 401 || parsedStatus === 'UNAUTHENTICATED' || /invalid_grant/i.test(text)) kind = 'auth';
-    return new UpstreamError(`upstream ${status}: ${text.slice(0, 400)}`, {
-      status: status >= 500 ? 502 : status,
-      accountId,
-      kind,
-    });
   }
 }

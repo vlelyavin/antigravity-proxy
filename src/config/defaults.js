@@ -51,5 +51,9 @@ export const DEFAULTS = {
   rotation: {
     // after a 429 RESOURCE_EXHAUSTED the account cools down for this long (ms)
     cooldownMs: 60_000,
+    // Total budget for one request, preparation through the last fallback (ms). Mari cuts a turn
+    // at 120 s, so the default sits just under it; raise it for callers that wait longer. The
+    // per-attempt ladder (rotation.attemptTimeoutsMs) only shortens attempts inside this budget.
+    requestDeadlineMs: 110_000,
   },
 };
