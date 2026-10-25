@@ -106,6 +106,45 @@ test('a transient upstream failure journals the category, not the body, the emai
   }
 });
 
+test('a rejected non-stream collection journals its bounded shape, never its content', async () => {
+  const sink = journal();
+  const stack = await startRelay({
+    accounts: [ACCOUNT],
+    logger: sink.logger,
+    respond: (res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const entry of [
+        { response: { candidates: [{ content: { parts: [{ text: 'SENTINEL_COMPLETION_TEXT' }] } }] } },
+        { response: { candidates: [{ content: { parts: [{ text: 'SENTINEL_THOUGHT_TEXT', thought: true }] } }] } },
+        { response: { candidates: [{ content: { parts: [{ functionCall: { name: 'SENTINEL_TOOL_NAME', args: { q: 'SENTINEL_TOOL_ARGS' } }, thoughtSignature: 'SENTINEL_THOUGHT_SIGNATURE' }] } }] } },
+        { response: { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'SENTINEL_MEDIA_BYTES' } }] } }] } },
+      ]) res.write(`data: ${JSON.stringify(entry)}\n\n`);
+      res.end();
+    },
+  });
+  try {
+    const res = await chat(stack.port);
+    assert.equal(res.status, 502);
+    assert.doesNotMatch(res.text, /SENTINEL_/, 'the caller gets the protocol error, not the answer');
+    const text = sink.text();
+    // how far the answer got, in fixed names and numbers only
+    assert.match(text, /chat\.collect_failed .*frameCount=4/);
+    assert.match(text, /chat\.collect_failed .*candidateCount=1/);
+    assert.match(text, /chat\.collect_failed .*textFrames=1/);
+    assert.match(text, /chat\.collect_failed .*reasoningFrames=1/);
+    assert.match(text, /chat\.collect_failed .*toolFrames=1/);
+    assert.match(text, /chat\.collect_failed .*signatureOnlyFrames=0/);
+    assert.match(text, /chat\.collect_failed .*terminalSeen=false/);
+    assert.match(text, /chat\.collect_failed .*wrappedError=false/);
+    assert.match(text, /chat\.collect_failed .*endClass="error"/);
+    assert.match(text, new RegExp(`chat\\.collect_failed .*account=${JSON.stringify(accountLabel(ACCOUNT))}`));
+    assertAbsent(text, ['SENTINEL_COMPLETION_TEXT', 'SENTINEL_THOUGHT_TEXT', 'SENTINEL_TOOL_NAME',
+      'SENTINEL_TOOL_ARGS', 'SENTINEL_THOUGHT_SIGNATURE', 'SENTINEL_MEDIA_BYTES']);
+  } finally {
+    stack.close();
+  }
+});
+
 test('a refusal is journaled as a boolean, its text stays in the client response only', async () => {
   const sink = journal();
   const stack = await startRelay({

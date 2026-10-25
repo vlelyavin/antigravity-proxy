@@ -139,6 +139,7 @@ test('fallback disabled -> upstream 429 propagates', async () => {
     const res = await post(stack.port, GEMINI_429);
     assert.equal(res.status, 429);
     assert.equal(stack.vertex.calls.length, 0);
+    assert.equal(stack.pool.healthy(ONE_ACCOUNT).length, 0, 'a genuine 429 still cools its account');
   } finally {
     stack.server.close(); stack.upstreamServer.close(); stack.vertex.server.close();
   }

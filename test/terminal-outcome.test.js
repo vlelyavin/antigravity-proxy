@@ -43,24 +43,51 @@ function sse(frames) {
   return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
 }
 
-/** One non-stream request through the rotation handler against a stubbed upstream. */
-async function collect({ responses, accounts = ACCOUNTS }) {
+/**
+ * Drives the rotation handler over one shared pool and journal: each request draws its own response
+ * list (the last entry repeats), and a rejected request returns its error instead of throwing, so
+ * the journal and the pool stay reachable for the assertions. An entry is a Response for a single
+ * attempt or a thunk that builds a fresh one - a Response body reads once, so an entry reused by a
+ * rotation retry must be a thunk.
+ */
+function rotationStage({ accounts = ACCOUNTS } = {}) {
   const { logger, events } = recorder();
   const pool = new AccountPool({ logger });
-  let call = 0;
+  const state = { calls: 0, responses: [] };
   const upstream = {
     invalidate() {},
     async generateStream() {
-      // each call gets the next response; the last one repeats
-      return responses[Math.min(call++, responses.length - 1)];
+      const entry = state.responses[Math.min(state.calls++, state.responses.length - 1)];
+      return typeof entry === 'function' ? entry() : entry;
     },
   };
-  let raw = null;
-  const res = { headersSent: false, writeHead() { this.headersSent = true; }, end(value) { raw = JSON.parse(value); } };
-  await handleWithRotation({
-    pool, store: { readAll: () => accounts }, upstream, config: CONFIG_NO_FALLBACK, logger, openAiBody: BODY, res, signal: null,
-  });
-  return { raw, pool, events };
+  return {
+    pool,
+    events,
+    async request(responses) {
+      state.responses = responses;
+      state.calls = 0;
+      let raw = null;
+      const res = { headersSent: false, writeHead() { this.headersSent = true; }, end(value) { raw = JSON.parse(value); } };
+      try {
+        await handleWithRotation({
+          pool, store: { readAll: () => accounts }, upstream, config: CONFIG_NO_FALLBACK,
+          logger, openAiBody: BODY, res, signal: null,
+        });
+        return { raw, error: null, calls: state.calls };
+      } catch (error) {
+        return { raw, error, calls: state.calls };
+      }
+    },
+  };
+}
+
+/** One non-stream request through the rotation handler against a stubbed upstream. */
+async function collect({ responses, accounts = ACCOUNTS }) {
+  const stage = rotationStage({ accounts });
+  const { raw, error } = await stage.request(responses);
+  if (error) throw error;
+  return { raw, pool: stage.pool, events: stage.events };
 }
 
 /** One client-stream request through a real relay in front of a synthetic upstream. */
@@ -128,22 +155,95 @@ test('STOP, MAX_TOKENS and a safety block keep their documented mapping', async 
   assert.equal(promptBlock.raw.choices[0].message.refusal, 'PROHIBITED_CONTENT');
 });
 
-test('MALFORMED_FUNCTION_CALL fails the attempt and rotates like any other pre-header 502', async () => {
-  const { raw, pool, events } = await collect({
-    responses: [
-      sse([frame([{ text: 'partial' }], 'MALFORMED_FUNCTION_CALL')]),
-      sse([frame([{ text: 'second account' }], 'STOP')]),
-    ],
-  });
-  assert.equal(raw.choices[0].finish_reason, 'stop');
-  assert.equal(raw.choices[0].message.content, 'second account');
-  // nothing was written to the caller, so the request is classified by the existing pre-header
-  // 502 rule (transient: cool and fail over) - this change does not touch that policy
-  assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a1']);
-  const attempts = events.filter((e) => e.event === 'attempt.timing');
-  assert.equal(attempts[0].outcome, 'transient');
-  assert.equal(attempts[0].reason, 'terminal:502', 'the journal carries the terminal category');
-  assert.equal(attempts[1].outcome, 'ok');
+test('a protocol failure fails the attempt, gets one alternate account and cools nobody', async () => {
+  const protocol = {
+    terminal: sse([frame([{ text: 'partial' }], 'MALFORMED_FUNCTION_CALL')]),
+    truncated: sse([frame([{ text: 'partial' }])]),
+    // a raw line that is not JSON at all (sse() would encode a string as valid JSON)
+    malformed: new Response('data: {not json\n\n', { headers: { 'content-type': 'text/event-stream' } }),
+  };
+  for (const [kind, failure] of Object.entries(protocol)) {
+    const { raw, pool, events } = await collect({
+      responses: [failure, sse([frame([{ text: 'second account' }], 'STOP')])],
+    });
+    assert.equal(raw.choices[0].finish_reason, 'stop', kind);
+    assert.equal(raw.choices[0].message.content, 'second account', kind);
+    // the answer was unusable, the account was not: one alternate, nobody cooled
+    assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a0', 'a1'], `${kind} cools nobody`);
+    assert.ok(!events.some((e) => e.event === 'account.cooldown'), kind);
+    const attempts = events.filter((e) => e.event === 'attempt.timing');
+    assert.deepEqual(attempts.map((a) => a.outcome), ['protocol', 'ok'], kind);
+    assert.equal(attempts[0].reason, `${kind}:502`, 'the journal carries the protocol category');
+    const line = events.find((e) => e.event === 'rotation.protocol');
+    assert.equal(line.kind, kind);
+    assert.equal(line.protocolAttempts, 1);
+  }
+});
+
+test('six truncating accounts stop after two protocol attempts, cool nobody, and the next request answers', async () => {
+  const accounts = Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, email: `synthetic${i}@example.com`, projectId: 'p' }));
+  const stage = rotationStage({ accounts });
+  const truncated = () => sse([frame([{ text: 'partial' }])]);
+
+  const first = await stage.request([truncated]);
+  assert.ok(first.error instanceof UpstreamError, 'the request fails');
+  assert.equal(first.error.kind, 'truncated');
+  assert.equal(first.error.status, 502, 'the caller sees the protocol failure, not a fabricated 429');
+  assert.equal(first.calls, 2, 'one alternate account, not six');
+  assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), accounts.map((a) => a.id), 'all six accounts stay healthy');
+  assert.ok(!stage.events.some((e) => e.event === 'account.cooldown'), 'no cooldown at all');
+  const attempts = stage.events.filter((e) => e.event === 'attempt.timing');
+  assert.deepEqual(attempts.map((a) => a.outcome), ['protocol', 'protocol']);
+  assert.deepEqual(attempts.map((a) => a.reason), ['truncated:502', 'truncated:502']);
+  const request1 = stage.events.find((e) => e.event === 'request.timing');
+  assert.equal(request1.outcome, 'failed');
+  assert.equal(request1.status, 502);
+  assert.equal(request1.attempts, 2);
+  assert.equal(request1.reason, 'truncated:502');
+
+  // no cooldown window to wait out: the next ordinary request answers on the first account at once
+  const second = await stage.request([sse([frame([{ text: 'healthy' }], 'STOP')])]);
+  assert.equal(second.error, null);
+  assert.equal(second.raw.choices[0].message.content, 'healthy');
+  assert.equal(second.calls, 1);
+});
+
+test('protocol failures mixed with a real quota failure cool only the quota account', async () => {
+  const accounts = Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
+  const stage = rotationStage({ accounts });
+  const quota = sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]);
+  const truncated = () => sse([frame([{ text: 'partial' }])]); // one body read per attempt
+
+  const { error, calls } = await stage.request([quota, truncated, truncated, sse([frame([{ text: 'never reached' }], 'STOP')])]);
+  assert.ok(error instanceof UpstreamError);
+  assert.equal(error.kind, 'truncated');
+  assert.equal(error.status, 502);
+  assert.equal(calls, 3, 'the real 429, then the two protocol attempts: no more');
+  assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), ['a1', 'a2', 'a3'], 'only the 429 account sits out');
+  assert.equal(stage.events.filter((e) => e.event === 'account.cooldown').length, 1);
+  const attempts = stage.events.filter((e) => e.event === 'attempt.timing');
+  assert.deepEqual(attempts.map((a) => a.outcome), ['quota', 'protocol', 'protocol']);
+  assert.equal(attempts[0].reason, 'quota:429');
+});
+
+test('a spent pool keeps the real protocol failure instead of a fabricated quota 429', async () => {
+  const accounts = [
+    { id: 'a0', email: 'pool0@example.com', projectId: 'p' },
+    { id: 'a1', email: 'pool1@example.com', projectId: 'p' },
+  ];
+  const stage = rotationStage({ accounts });
+  stage.pool.cooldown('a1', 60_000); // a1 is already cooling after its own genuine 429
+
+  const { error, calls } = await stage.request([sse([frame([{ text: 'partial' }])])]);
+  assert.ok(error instanceof UpstreamError, 'the request fails');
+  assert.equal(error.kind, 'truncated', 'not overwritten with a quota 429');
+  assert.equal(error.status, 502);
+  assert.doesNotMatch(error.message, /cooling down/);
+  assert.equal(calls, 1, 'a0 answered; the cooling a1 was never tried');
+  assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), ['a0'], 'a0 stays healthy');
+  const request1 = stage.events.find((e) => e.event === 'request.timing');
+  assert.equal(request1.status, 502);
+  assert.equal(request1.reason, 'truncated:502');
 });
 
 test('an unexpected or unknown finish reason never becomes stop', async () => {
@@ -194,6 +294,24 @@ test('an unsuccessful terminal in the client stream is an error frame, not a cle
   assert.equal(attempts[0].reason, 'terminal:502');
   const request1 = events.find((e) => e.event === 'request.timing');
   assert.equal(request1.outcome, 'failed');
+});
+
+test('an upstream error inside the response wrapper is an error frame, classified like a bare one', async () => {
+  const error = { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' };
+  for (const errorFrame of [{ error }, { response: { error } }]) {
+    const { status, text, events, pool } = await collectStream({
+      frames: [frame([{ text: 'partial' }]), errorFrame],
+      accounts: ACCOUNTS,
+    });
+    assert.equal(status, 200, 'the client stream was already open');
+    assert.match(text, /"content":"partial"/, 'what the caller already received is not retracted');
+    assert.match(text, /upstream stream failed/);
+    assert.match(text, /\[DONE\]/);
+    const attempt = events.find((e) => e.event === 'attempt.timing');
+    assert.equal(attempt.outcome, 'stream_failed');
+    assert.equal(attempt.reason, 'quota:429', 'the wrapped error classifies by its own status');
+    assert.equal(pool.healthy(ACCOUNTS).length, 2, 'a stream that was already open cools nobody');
+  }
 });
 
 test('a client stream that ends without a terminal frame fails instead of sending a lone DONE', async () => {

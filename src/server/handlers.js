@@ -91,6 +91,29 @@ export function failureReason(error) {
   return errorCategory(error);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Protocol failures are not account failures.
+//
+// A protocol failure is the answer itself being unusable: the body ended without a terminal frame
+// (`truncated`), carried an unsuccessful or malformed finish reason (`terminal`), or carried a frame
+// that is not JSON (`malformed`). The request did reach the backend and the backend did answer, so
+// the account's quota and credentials are not in question. Cooling an account for it hides the real
+// cause and takes healthy accounts out of the pool: the incident of 25.10 cooled six of them in
+// 28 s, and the recovery then got a fabricated 429. A protocol failure cools nobody and buys one
+// alternate account - two protocol attempts per request, then the request stops even while other
+// accounts are healthy, because a request shape the backend truncates truncates everywhere. Quota
+// (429) and transport (502/504 before any caller bytes) failures keep their own policy: cool that
+// account and fail over to every remaining one. The protocol cap never shortens that failover, and
+// every attempt - protocol or not - stays inside the request deadline and the attempt ladder.
+// ---------------------------------------------------------------------------------------------
+const PROTOCOL_FAILURE_KINDS = new Set(['truncated', 'terminal', 'malformed']);
+const MAX_PROTOCOL_ATTEMPTS = 2;
+
+/** Does this failure say "the answer was unusable" rather than "this account cannot serve"? */
+export function isProtocolFailure(error) {
+  return error instanceof UpstreamError && PROTOCOL_FAILURE_KINDS.has(error.kind);
+}
+
 function clientAbortError() {
   return new UpstreamError('client disconnected', { status: 499, kind: 'client_abort' });
 }
@@ -128,6 +151,16 @@ function rawFinishReason(frame) {
   const wrapper = frame?.response ?? frame;
   const reason = wrapper?.candidates?.[0]?.finishReason;
   return reason ?? null;
+}
+
+/**
+ * An explicit upstream error object carried by a frame or a plain JSON body: bare (`error`) or
+ * inside the response wrapper (`response.error`). Nothing else is unwrapped - the translator's own
+ * shape rules stay where they are. Either position classifies by the same status the bare one
+ * always did, so rotation keys off it identically.
+ */
+function explicitUpstreamError(payload) {
+  return payload?.error || payload?.response?.error || null;
 }
 
 function unsuccessfulTerminal(accountId, finishReason) {
@@ -234,9 +267,12 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
   }
   // 2026-10-19: перебор ВСЕХ аккаунтов, а не трёх. Мари не должна видеть 429,
   // пока в пуле есть живые аккаунты (7 аккаунтов, 3 попытки = 4 живых простаивали).
+  // 2026-10-25: это правило для квоты и транспорта; протокольный сбой
+  // (truncated/terminal/malformed) ограничен двумя попытками - см. PROTOCOL_FAILURE_KINDS.
   const maxAttempts = accounts.length;
   const tried = new Set();
   let attempts = 0;
+  let protocolAttempts = 0;
   let requestOutcome = 'failed';
   let status = 502;
 
@@ -247,9 +283,13 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
       if (outOfTime()) { requestOutcome = 'deadline'; lastError = deadlineError(deadlineMs); break; }
       const account = pool.pick(accounts, tried);
       if (!account) {
-        // all accounts cooling down: fail fast, do not hammer the exhausted pool
-        lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
-        status = 429;
+        // Every account is either cooling down or already tried by this request. Only a genuine
+        // quota exhaustion of the pool is a 429: overwriting a real failure with a fabricated one
+        // would answer a truncated answer with "rate limited" and hide why the request failed.
+        if (!lastError || (lastError instanceof UpstreamError && lastError.kind === 'quota')) {
+          lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
+          status = 429;
+        }
         break;
       }
       tried.add(account.id);
@@ -335,6 +375,16 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
           upstream.invalidate(account.id);
           logger.warn('rotation.auth', { requestId, account: accountLabel(account), attempt });
           retry = true;
+        } else if (isProtocolFailure(error) && !res.headersSent) {
+          // The answer was unusable, the account was not: it keeps its place in the pool and the
+          // request gets one alternate account only. A protocol failure after caller bytes (an
+          // already-started client stream) can never rotate; the reported branch above ends it.
+          attemptOutcome = 'protocol';
+          protocolAttempts += 1;
+          logger.warn('rotation.protocol', {
+            requestId, account: accountLabel(account), attempt, kind: error.kind, protocolAttempts,
+          });
+          retry = protocolAttempts < MAX_PROTOCOL_ATTEMPTS;
         } else if (error instanceof UpstreamError && (error.status === 502 || error.status === 504) && !res.headersSent) {
           // 2026-10-17: transient lane/proxy failures (502/504 before any bytes were written)
           // must fail over to the next account instead of surfacing a break to the client.
@@ -474,11 +524,69 @@ function truncatedCompletion(accountId) {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Bounded, payload-free shape of a rejected non-stream collection.
+//
+// The incident of 25.10 left one question that no existing journal line answered: how far did the
+// answer get, and in which shape did it stop? These counters answer exactly that and nothing else -
+// fixed names, numbers, two booleans and one enum, never a key, text, tool name, argument,
+// signature, media byte or upstream message, so no prompt or answer can travel through them.
+// The streaming lane keeps its own lines and is deliberately not instrumented here.
+// ---------------------------------------------------------------------------------------------
+function collectionShape() {
+  return {
+    frameCount: 0,
+    candidateCount: 0,
+    textFrames: 0,
+    reasoningFrames: 0,
+    toolFrames: 0,
+    signatureOnlyFrames: 0,
+    terminalSeen: false,
+    wrappedError: false,
+  };
+}
+
+/** Counts one parsed frame; `wrappedError` is specifically the wrapped (`response.error`) position. */
+function observeFrameShape(frame, shape) {
+  const wrapper = frame?.response ?? frame;
+  const candidates = Array.isArray(wrapper?.candidates) ? wrapper.candidates : [];
+  const parts = Array.isArray(candidates[0]?.content?.parts) ? candidates[0].content.parts : [];
+  const hasText = parts.some((part) => typeof part?.text === 'string' && part.text !== '' && part.thought !== true);
+  const hasReasoning = parts.some((part) => typeof part?.text === 'string' && part.text !== '' && part.thought === true);
+  const hasTool = parts.some((part) => Boolean(part?.functionCall));
+  const hasSignature = parts.some((part) => typeof part?.thoughtSignature === 'string' && part.thoughtSignature !== '');
+  shape.frameCount += 1;
+  shape.candidateCount = candidates.length;
+  if (frame?.response?.error) shape.wrappedError = true;
+  if (hasText) shape.textFrames += 1;
+  if (hasReasoning) shape.reasoningFrames += 1;
+  if (hasTool) shape.toolFrames += 1;
+  if (hasSignature && !hasText && !hasReasoning && !hasTool) shape.signatureOnlyFrames += 1;
+  if (rawFinishReason(frame) !== null) shape.terminalSeen = true;
+}
+
 // non-stream клиенту отдаём обычный JSON, но к апстриму идём стримом:
 // generateContent собирает ответ целиком и на длинных текстах выходит за
 // любой разумный таймаут, streamGenerateContent отдаёт те же данные первого
 // токена за секунды. Функция склеивает дельты в один completion.
-async function collectCompletion({ upstream, openAiBody, account, signal, model, timing, flow }) {
+async function collectCompletion(options) {
+  const shape = collectionShape();
+  try {
+    return await collectFrames(options, shape);
+  } catch (error) {
+    // one bounded line per rejected collection; the caller keeps the original error object
+    options.logger.warn('chat.collect_failed', {
+      requestId: options.requestId,
+      account: accountLabel(options.account),
+      // fixed enum: 'error' for a rejected collection, 'abort' for a cancellation or a deadline
+      endClass: options.signal?.aborted === true ? 'abort' : 'error',
+      ...shape,
+    });
+    throw error;
+  }
+}
+
+async function collectFrames({ upstream, openAiBody, account, signal, model, timing, flow }, shape) {
   const upstreamResponse = await upstream.generateStream({ openAiBody, account, signal });
   timing.prepMs = Date.now() - timing.startedAt;
   // апстрим иногда отвечает обычным JSON даже на sse-эндпоинт: не ломаемся.
@@ -488,8 +596,10 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
   const hasStream = upstreamResponse.body && typeof upstreamResponse.body[Symbol.asyncIterator] === "function";
   if ((hasHeaders && !type.includes("text/event-stream")) || !hasStream) {
     const json = await upstreamResponse.json();
-    // an upstream error object is a failure, not an empty completion
-    if (json?.error) throw upstreamErrorFromJson(json.error, account.id);
+    observeFrameShape(json, shape);
+    // an upstream error object is a failure, not an empty completion - bare or wrapped
+    const explicitError = explicitUpstreamError(json);
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id);
     const wrapper = json?.response ?? json;
     const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
     const terminal = rawFinishReason(json);
@@ -516,7 +626,10 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
     if (!payload || payload === '[DONE]') return;
     let frame;
     try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id); }
-    if (frame?.error) throw upstreamErrorFromJson(frame.error, account.id);
+    observeFrameShape(frame, shape);
+    // an explicit upstream error is a failure, not a keepalive - bare or in the response wrapper
+    const explicitError = explicitUpstreamError(frame);
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id);
     const terminal = rawFinishReason(frame);
     if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
     const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
@@ -589,7 +702,9 @@ async function collectCompletion({ upstream, openAiBody, account, signal, model,
 
 async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false, timing, flow, requestId }) {
   if (!respondNative) {
-    const openAiJson = await collectCompletion({ upstream, openAiBody, account, signal, model: openAiBody.model, timing, flow });
+    const openAiJson = await collectCompletion({
+      upstream, logger, requestId, openAiBody, account, signal, model: openAiBody.model, timing, flow,
+    });
     const body = JSON.stringify(openAiJson);
     res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
     res.end(body);
@@ -687,8 +802,9 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
       if (!payload || payload === '[DONE]') continue;
       let frame;
       try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id); }
-      // an explicit upstream error is a failure, not a quietly finished answer
-      if (frame?.error) throw upstreamErrorFromJson(frame.error, account.id);
+      // an explicit upstream error is a failure, not a quietly finished answer - bare or wrapped
+      const explicitError = explicitUpstreamError(frame);
+      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id);
       const terminal = rawFinishReason(frame);
       // an unsuccessful or unknown terminal must never reach the client as a clean stop
       if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);

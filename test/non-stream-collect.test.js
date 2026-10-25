@@ -6,6 +6,7 @@ import { loadConfig } from '../src/config/load-config.js';
 import { createLogger } from '../src/utils/logger.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { UpstreamClient, UpstreamError } from '../src/upstream/upstream-client.js';
+import { accountLabel } from '../src/utils/alias.js';
 import { createServer } from '../src/server/create-server.js';
 import { handleWithRotation } from '../src/server/handlers.js';
 
@@ -53,15 +54,21 @@ function sseResponse(frames, { chunkSize = 0, trailingBreak = true } = {}) {
 
 /**
  * Runs one non-stream request with a synthetic upstream, so the collector sees exactly the frames
- * a real generation would send. `responses` gives each call its own frame list (rotation tests).
+ * a real generation would send. `responses` gives each call its own frame list (rotation tests),
+ * `respond` takes over the whole response (a body that reacts to a cancellation), and a rejected
+ * request is returned rather than thrown so its journal stays reachable.
  */
-async function collect({ frames = [], responses = null, json = null, chunkSize = 0, trailingBreak = true, accounts = ACCOUNTS, attemptTimeoutsMs = [] } = {}) {
+async function run({
+  frames = [], responses = null, json = null, chunkSize = 0, trailingBreak = true,
+  accounts = ACCOUNTS, attemptTimeoutsMs = [], signal = null, respond = null,
+} = {}) {
   const { logger, events } = recorder();
   const pool = new AccountPool({ logger });
   let call = 0;
   const upstream = {
     invalidate() {},
     async generateStream() {
+      if (respond) return respond();
       if (json) return Response.json(json);
       const next = responses ? responses[call++] : frames;
       return sseResponse(next, { chunkSize, trailingBreak });
@@ -73,10 +80,22 @@ async function collect({ frames = [], responses = null, json = null, chunkSize =
     writeHead() { this.headersSent = true; },
     end(value) { raw = JSON.parse(value); },
   };
-  await handleWithRotation({
-    pool, store: { readAll: () => accounts }, upstream, config: CONFIG_NO_FALLBACK, logger, openAiBody: BODY, res, signal: null, attemptTimeoutsMs,
-  });
-  return { raw, pool, events };
+  let error = null;
+  try {
+    await handleWithRotation({
+      pool, store: { readAll: () => accounts }, upstream, config: CONFIG_NO_FALLBACK, logger, openAiBody: BODY, res, signal, attemptTimeoutsMs,
+    });
+  } catch (caught) {
+    error = caught;
+  }
+  return { raw, pool, events, error };
+}
+
+/** The same one request, with a rejection kept as a rejection: most cases read that way. */
+async function collect(options = {}) {
+  const result = await run(options);
+  if (result.error) throw result.error;
+  return result;
 }
 
 test('thought signatures and tool arguments survive the non-stream collection', async () => {
@@ -115,16 +134,19 @@ test('plain JSON on the SSE endpoint requires a terminal candidate or a prompt r
   assert.equal(refused.raw.choices[0].message.refusal, 'PROHIBITED_CONTENT');
 });
 
-test('an explicit upstream error frame rotates to the next account instead of succeeding', async () => {
-  const { raw, pool, events } = await collect({
-    responses: [
-      [{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }],
-      [frame([{ text: 'second account' }], 'STOP')],
-    ],
-  });
-  assert.equal(raw.choices[0].message.content, 'second account');
-  assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a1'], 'the erroring account sits out its cooldown');
-  assert.ok(events.some((e) => e.event === 'rotation.quota'));
+test('an explicit upstream error frame rotates the next account in, bare or in the response wrapper', async () => {
+  const error = { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' };
+  for (const entry of [{ error }, { response: { error } }]) {
+    const { raw, pool, events } = await collect({
+      responses: [
+        [entry],
+        [frame([{ text: 'second account' }], 'STOP')],
+      ],
+    });
+    assert.equal(raw.choices[0].message.content, 'second account');
+    assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a1'], 'the erroring account sits out its cooldown');
+    assert.ok(events.some((e) => e.event === 'rotation.quota'), 'the status still classifies it as quota');
+  }
 });
 
 test('a malformed frame is a protocol failure, not a silently skipped line', async () => {
@@ -134,24 +156,88 @@ test('a malformed frame is a protocol failure, not a silently skipped line', asy
   );
 });
 
-test('an error body on the streaming endpoint is not an empty completion', async () => {
-  const { logger } = recorder();
-  const upstream = {
-    invalidate() {},
-    async generateStream() {
-      return new Response(JSON.stringify({ error: { code: 503, message: 'backend busy', status: 'UNAVAILABLE' } }), {
-        headers: { 'content-type': 'application/json' },
-      });
-    },
-  };
-  const res = { headersSent: false, writeHead() { this.headersSent = true; }, end() {} };
-  await assert.rejects(
-    handleWithRotation({
-      pool: new AccountPool({ logger }), store: { readAll: () => [ACCOUNTS[0]] }, upstream,
-      config: CONFIG_NO_FALLBACK, logger, openAiBody: BODY, res, signal: null,
-    }),
-    (error) => error instanceof UpstreamError && error.status === 502 && /UNAVAILABLE|backend busy/.test(error.message),
-  );
+test('an error body on the streaming endpoint is not an empty completion, bare or wrapped', async () => {
+  const error = { code: 503, message: 'backend busy', status: 'UNAVAILABLE' };
+  for (const body of [{ error }, { response: { error } }]) {
+    const { logger } = recorder();
+    const upstream = {
+      invalidate() {},
+      async generateStream() {
+        return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+      },
+    };
+    const res = { headersSent: false, writeHead() { this.headersSent = true; }, end() {} };
+    await assert.rejects(
+      handleWithRotation({
+        pool: new AccountPool({ logger }), store: { readAll: () => [ACCOUNTS[0]] }, upstream,
+        config: CONFIG_NO_FALLBACK, logger, openAiBody: BODY, res, signal: null,
+      }),
+      (caught) => caught instanceof UpstreamError && caught.status === 502 && /UNAVAILABLE|backend busy/.test(caught.message),
+    );
+  }
+});
+
+test('a rejected collection journals its bounded shape and never its content', async () => {
+  // one frame per counted shape: text, thought, tool call, signature-only
+  const frames = [
+    frame([{ text: 'SENTINEL_TEXT' }]),
+    frame([{ text: 'SENTINEL_THOUGHT', thought: true }]),
+    frame([{ functionCall: { name: 'SENTINEL_TOOL', args: { q: 'SENTINEL_ARGS' } }, thoughtSignature: 'SENTINEL_SIGNATURE' }]),
+    { response: { candidates: [{ content: { parts: [{ thoughtSignature: 'SENTINEL_SIGNATURE' }] } }] } },
+  ];
+  const truncated = await run({ frames, accounts: [ACCOUNTS[0]] });
+  assert.ok(truncated.error instanceof UpstreamError);
+  assert.equal(truncated.error.kind, 'truncated', 'the caller keeps the original error object');
+  const line = truncated.events.find((e) => e.event === 'chat.collect_failed');
+  assert.equal(line.frameCount, 4);
+  assert.equal(line.candidateCount, 1, 'candidates of the last frame');
+  assert.equal(line.textFrames, 1);
+  assert.equal(line.reasoningFrames, 1);
+  assert.equal(line.toolFrames, 1);
+  assert.equal(line.signatureOnlyFrames, 1);
+  assert.equal(line.terminalSeen, false);
+  assert.equal(line.wrappedError, false);
+  assert.equal(line.endClass, 'error');
+  assert.equal(line.account, accountLabel(ACCOUNTS[0]));
+
+  // an error object hidden in the response wrapper is called out as such
+  const wrapped = await run({
+    frames: [
+      frame([{ text: 'SENTINEL_TEXT' }]),
+      { response: { error: { code: 500, message: 'SENTINEL_UPSTREAM_ERROR', status: 'INTERNAL' } } },
+    ],
+    accounts: [ACCOUNTS[0]],
+  });
+  assert.equal(wrapped.error.kind, 'other');
+  const wrappedLine = wrapped.events.find((e) => e.event === 'chat.collect_failed');
+  assert.equal(wrappedLine.frameCount, 2);
+  assert.equal(wrappedLine.wrappedError, true);
+
+  // a cancellation mid-collection is the abort class, and the caller keeps the cancellation
+  const controller = new AbortController();
+  const encoder = new TextEncoder();
+  const partial = encoder.encode(`data: ${JSON.stringify(frame([{ text: 'SENTINEL_TEXT' }]))}\n\n`);
+  const aborting = await run({
+    accounts: [ACCOUNTS[0]],
+    signal: controller.signal,
+    respond: () => new Response(new ReadableStream({
+      start(stream) { stream.enqueue(partial); },
+      pull(stream) {
+        controller.abort(new Error('client disconnected'));
+        stream.enqueue(partial);
+        stream.close();
+      },
+    }), { headers: { 'content-type': 'text/event-stream' } }),
+  });
+  assert.equal(aborting.error.message, 'client disconnected', 'the cancellation is not rewritten');
+  assert.equal(aborting.events.find((e) => e.event === 'chat.collect_failed').endClass, 'abort');
+
+  for (const diagnostic of [...truncated.events, ...wrapped.events].filter((e) => e.event === 'chat.collect_failed')) {
+    const text = JSON.stringify(diagnostic);
+    for (const sentinel of ['SENTINEL_TEXT', 'SENTINEL_THOUGHT', 'SENTINEL_TOOL', 'SENTINEL_ARGS', 'SENTINEL_SIGNATURE', 'SENTINEL_UPSTREAM_ERROR']) {
+      assert.equal(text.includes(sentinel), false, `the diagnostic leaked ${sentinel}:\n${text}`);
+    }
+  }
 });
 
 test('content, reasoning and finish reasons are stitched exactly across chunk boundaries', async () => {

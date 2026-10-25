@@ -23,6 +23,12 @@ function fakeUpstream({ hangMs = 0, sse } = {}) {
         res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
         return;
       }
+      if (parsed.project === 'p-502') {
+        // a transport failure before any bytes: the lane/proxy is dead, the account itself is fine
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { code: 502, message: 'bad gateway', status: 'UNAVAILABLE' } }));
+        return;
+      }
       if (hangMs > 0) {
         setTimeout(() => {
           res.writeHead(200, { 'content-type': 'application/json' });
@@ -220,6 +226,25 @@ test('429 rotates to the second account (kind=quota)', async () => {
     assert.equal(json.choices[0].message.content, 'hey');
     // and q1 sits out its cooldown
     assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
+  } finally {
+    stack.server.close(); stack.upstreamServer.close();
+  }
+});
+
+test('a transport 502 still cools that account and fails over to the next one', async () => {
+  const stack = await startStack({
+    accounts: [
+      { id: 't1', email: 'deadlane@x', projectId: 'p-502' },
+      { id: 't2', email: 'alive@x', projectId: 'p' },
+    ],
+  });
+  try {
+    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.choices[0].message.content, 'hey');
+    // the dead lane sits out the short transport cooldown; the account that answered keeps its place
+    assert.deepEqual(stack.pool.healthy([{ id: 't1' }, { id: 't2' }]).map((a) => a.id), ['t2']);
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }
