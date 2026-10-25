@@ -52,12 +52,7 @@ function sseResponse(frames, { chunkSize = 0, trailingBreak = true } = {}) {
   }), { headers: { 'content-type': 'text/event-stream' } });
 }
 
-/**
- * Runs one non-stream request with a synthetic upstream, so the collector sees exactly the frames
- * a real generation would send. `responses` gives each call its own frame list (rotation tests),
- * `respond` takes over the whole response (a body that reacts to a cancellation), and a rejected
- * request is returned rather than thrown so its journal stays reachable.
- */
+// Keep rejected requests' journal and pool available to assertions.
 async function run({
   frames = [], responses = null, json = null, chunkSize = 0, trailingBreak = true,
   accounts = ACCOUNTS, attemptTimeoutsMs = [], signal = null, respond = null,
@@ -197,7 +192,7 @@ test('a rejected collection journals its bounded shape and never its content', a
   assert.equal(line.signatureOnlyFrames, 1);
   assert.equal(line.terminalSeen, false);
   assert.equal(line.wrappedError, false);
-  assert.equal(line.endClass, 'error');
+  assert.equal(line.endClass, 'clean');
   assert.equal(line.account, accountLabel(ACCOUNTS[0]));
 
   // an error object hidden in the response wrapper is called out as such
@@ -238,6 +233,33 @@ test('a rejected collection journals its bounded shape and never its content', a
       assert.equal(text.includes(sentinel), false, `the diagnostic leaked ${sentinel}:\n${text}`);
     }
   }
+});
+
+test('collection diagnostics distinguish clean EOF without a terminal from a failed body read', async () => {
+  const readError = new Error('SENTINEL_READ_ERROR');
+  const bytes = new TextEncoder().encode(`data: ${JSON.stringify(frame([{ text: 'SENTINEL_PARTIAL' }]))}\n\n`);
+  for (const failsRead of [false, true]) {
+    const result = await run({
+      accounts: [ACCOUNTS[0]],
+      respond: () => ({
+        headers: {},
+        body: (async function* () {
+          yield bytes;
+          if (failsRead) throw readError;
+        })(),
+      }),
+    });
+    if (failsRead) assert.equal(result.error, readError, 'read failure keeps its original identity');
+    else assert.equal(result.error.kind, 'truncated', 'clean EOF still fails terminal validation');
+    const diagnostic = result.events.find((event) => event.event === 'chat.collect_failed');
+    assert.equal(diagnostic.endClass, failsRead ? 'error' : 'clean');
+    assert.equal(diagnostic.frameCount, 1);
+    assert.equal(diagnostic.terminalSeen, false);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /SENTINEL_/);
+  }
+  const plainJson = await run({ json: frame([{ text: 'SENTINEL_JSON' }]), accounts: [ACCOUNTS[0]] });
+  assert.equal(plainJson.error.kind, 'truncated');
+  assert.equal(plainJson.events.find((event) => event.event === 'chat.collect_failed').endClass, 'clean');
 });
 
 test('content, reasoning and finish reasons are stitched exactly across chunk boundaries', async () => {

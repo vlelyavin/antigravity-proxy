@@ -52,14 +52,16 @@ https://daily-cloudcode-pa.googleapis.com/v1internal:*
 - a protocol failure - `kind` `truncated`, `terminal` or `malformed` - is the answer being unusable,
   not the account being unable. it cools nobody, and a non-stream request gets at most two protocol
   attempts (the first account plus one alternate), then fails with 502 even while other accounts are
-  healthy: a request shape the backend truncates truncates on every account. quota and transport
-  failover keep the whole pool, and every attempt stays inside the request deadline and the attempt
-  ladder.
+  healthy. quota and transport failures do not spend protocol attempts; their failover keeps the
+  whole pool, and every attempt stays inside the request deadline and the attempt ladder. this bounds
+  the damage from unusable answers without claiming to fix the upstream cause.
 - when there is nothing left to try, a prior non-quota failure is kept: the "all accounts are
   cooling down" 429 is answered only when the pool really is quota-exhausted.
 - a rejected non-stream collection journals one bounded shape line (`chat.collect_failed`) with
   counters, booleans and one enum: no key, text, tool name, argument, signature, media byte or
-  upstream message. the streaming lane is not instrumented.
+  upstream message. `endClass=clean` records normal body EOF followed by a validation failure;
+  `error` records failure before normal EOF (including read/parse errors), and `abort` records
+  cancellation or a timeout/deadline. the streaming lane is not instrumented.
 
 ## why the daily host
 

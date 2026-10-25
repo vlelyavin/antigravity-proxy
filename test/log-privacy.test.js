@@ -136,7 +136,7 @@ test('a rejected non-stream collection journals its bounded shape, never its con
     assert.match(text, /chat\.collect_failed .*signatureOnlyFrames=0/);
     assert.match(text, /chat\.collect_failed .*terminalSeen=false/);
     assert.match(text, /chat\.collect_failed .*wrappedError=false/);
-    assert.match(text, /chat\.collect_failed .*endClass="error"/);
+    assert.match(text, /chat\.collect_failed .*endClass="clean"/);
     assert.match(text, new RegExp(`chat\\.collect_failed .*account=${JSON.stringify(accountLabel(ACCOUNT))}`));
     assertAbsent(text, ['SENTINEL_COMPLETION_TEXT', 'SENTINEL_THOUGHT_TEXT', 'SENTINEL_TOOL_NAME',
       'SENTINEL_TOOL_ARGS', 'SENTINEL_THOUGHT_SIGNATURE', 'SENTINEL_MEDIA_BYTES']);

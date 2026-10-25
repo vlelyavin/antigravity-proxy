@@ -91,26 +91,11 @@ export function failureReason(error) {
   return errorCategory(error);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Protocol failures are not account failures.
-//
-// A protocol failure is the answer itself being unusable: the body ended without a terminal frame
-// (`truncated`), carried an unsuccessful or malformed finish reason (`terminal`), or carried a frame
-// that is not JSON (`malformed`). The request did reach the backend and the backend did answer, so
-// the account's quota and credentials are not in question. Cooling an account for it hides the real
-// cause and takes healthy accounts out of the pool: the incident of 25.10 cooled six of them in
-// 28 s, and the recovery then got a fabricated 429. A protocol failure cools nobody and buys one
-// alternate account - two protocol attempts per request, then the request stops even while other
-// accounts are healthy, because a request shape the backend truncates truncates everywhere. Quota
-// (429) and transport (502/504 before any caller bytes) failures keep their own policy: cool that
-// account and fail over to every remaining one. The protocol cap never shortens that failover, and
-// every attempt - protocol or not - stays inside the request deadline and the attempt ladder.
-// ---------------------------------------------------------------------------------------------
+// Unusable answers do not prove account failure or justify draining the healthy pool.
 const PROTOCOL_FAILURE_KINDS = new Set(['truncated', 'terminal', 'malformed']);
 const MAX_PROTOCOL_ATTEMPTS = 2;
 
-/** Does this failure say "the answer was unusable" rather than "this account cannot serve"? */
-export function isProtocolFailure(error) {
+function isProtocolFailure(error) {
   return error instanceof UpstreamError && PROTOCOL_FAILURE_KINDS.has(error.kind);
 }
 
@@ -153,12 +138,6 @@ function rawFinishReason(frame) {
   return reason ?? null;
 }
 
-/**
- * An explicit upstream error object carried by a frame or a plain JSON body: bare (`error`) or
- * inside the response wrapper (`response.error`). Nothing else is unwrapped - the translator's own
- * shape rules stay where they are. Either position classifies by the same status the bare one
- * always did, so rotation keys off it identically.
- */
 function explicitUpstreamError(payload) {
   return payload?.error || payload?.response?.error || null;
 }
@@ -283,9 +262,7 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
       if (outOfTime()) { requestOutcome = 'deadline'; lastError = deadlineError(deadlineMs); break; }
       const account = pool.pick(accounts, tried);
       if (!account) {
-        // Every account is either cooling down or already tried by this request. Only a genuine
-        // quota exhaustion of the pool is a 429: overwriting a real failure with a fabricated one
-        // would answer a truncated answer with "rate limited" and hide why the request failed.
+        // A spent pool must not mask its last real non-quota failure with a fabricated 429.
         if (!lastError || (lastError instanceof UpstreamError && lastError.kind === 'quota')) {
           lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
           status = 429;
@@ -376,9 +353,7 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
           logger.warn('rotation.auth', { requestId, account: accountLabel(account), attempt });
           retry = true;
         } else if (isProtocolFailure(error) && !res.headersSent) {
-          // The answer was unusable, the account was not: it keeps its place in the pool and the
-          // request gets one alternate account only. A protocol failure after caller bytes (an
-          // already-started client stream) can never rotate; the reported branch above ends it.
+          // A protocol retry must leave shared account health unchanged.
           attemptOutcome = 'protocol';
           protocolAttempts += 1;
           logger.warn('rotation.protocol', {
@@ -524,17 +499,10 @@ function truncatedCompletion(accountId) {
   });
 }
 
-// ---------------------------------------------------------------------------------------------
-// Bounded, payload-free shape of a rejected non-stream collection.
-//
-// The incident of 25.10 left one question that no existing journal line answered: how far did the
-// answer get, and in which shape did it stop? These counters answer exactly that and nothing else -
-// fixed names, numbers, two booleans and one enum, never a key, text, tool name, argument,
-// signature, media byte or upstream message, so no prompt or answer can travel through them.
-// The streaming lane keeps its own lines and is deliberately not instrumented here.
-// ---------------------------------------------------------------------------------------------
+// Fixed counters distinguish rejected response shapes without retaining payloads.
 function collectionShape() {
   return {
+    endClass: 'error',
     frameCount: 0,
     candidateCount: 0,
     textFrames: 0,
@@ -578,9 +546,8 @@ async function collectCompletion(options) {
     options.logger.warn('chat.collect_failed', {
       requestId: options.requestId,
       account: accountLabel(options.account),
-      // fixed enum: 'error' for a rejected collection, 'abort' for a cancellation or a deadline
-      endClass: options.signal?.aborted === true ? 'abort' : 'error',
       ...shape,
+      endClass: options.signal?.aborted === true ? 'abort' : shape.endClass,
     });
     throw error;
   }
@@ -596,6 +563,7 @@ async function collectFrames({ upstream, openAiBody, account, signal, model, tim
   const hasStream = upstreamResponse.body && typeof upstreamResponse.body[Symbol.asyncIterator] === "function";
   if ((hasHeaders && !type.includes("text/event-stream")) || !hasStream) {
     const json = await upstreamResponse.json();
+    shape.endClass = 'clean';
     observeFrameShape(json, shape);
     // an upstream error object is a failure, not an empty completion - bare or wrapped
     const explicitError = explicitUpstreamError(json);
@@ -667,6 +635,8 @@ async function collectFrames({ upstream, openAiBody, account, signal, model, tim
     if (signal?.aborted) throw abortFailure(signal);
     consume(line);
   }
+  // A normal EOF may still fail terminal validation; keep it distinct from a failed read/parse.
+  shape.endClass = 'clean';
 
   if (id === null && !content && !reasoning && toolCalls.size === 0) {
     throw new Error('upstream stream produced no frames');

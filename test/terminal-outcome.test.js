@@ -43,13 +43,7 @@ function sse(frames) {
   return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
 }
 
-/**
- * Drives the rotation handler over one shared pool and journal: each request draws its own response
- * list (the last entry repeats), and a rejected request returns its error instead of throwing, so
- * the journal and the pool stay reachable for the assertions. An entry is a Response for a single
- * attempt or a thunk that builds a fresh one - a Response body reads once, so an entry reused by a
- * rotation retry must be a thunk.
- */
+// Repeated requests share pool health; response thunks provide fresh bodies for retries.
 function rotationStage({ accounts = ACCOUNTS } = {}) {
   const { logger, events } = recorder();
   const pool = new AccountPool({ logger });
@@ -208,22 +202,29 @@ test('six truncating accounts stop after two protocol attempts, cool nobody, and
   assert.equal(second.calls, 1);
 });
 
-test('protocol failures mixed with a real quota failure cool only the quota account', async () => {
-  const accounts = Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
-  const stage = rotationStage({ accounts });
-  const quota = sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]);
-  const truncated = () => sse([frame([{ text: 'partial' }])]); // one body read per attempt
-
-  const { error, calls } = await stage.request([quota, truncated, truncated, sse([frame([{ text: 'never reached' }], 'STOP')])]);
-  assert.ok(error instanceof UpstreamError);
-  assert.equal(error.kind, 'truncated');
-  assert.equal(error.status, 502);
-  assert.equal(calls, 3, 'the real 429, then the two protocol attempts: no more');
-  assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), ['a1', 'a2', 'a3'], 'only the 429 account sits out');
-  assert.equal(stage.events.filter((e) => e.event === 'account.cooldown').length, 1);
-  const attempts = stage.events.filter((e) => e.event === 'attempt.timing');
-  assert.deepEqual(attempts.map((a) => a.outcome), ['quota', 'protocol', 'protocol']);
-  assert.equal(attempts[0].reason, 'quota:429');
+test('mixed quota and transport failures keep their cooldown policy and do not spend protocol attempts', async () => {
+  for (const outcomes of [['quota', 'protocol', 'protocol'], ['protocol', 'transient', 'quota', 'protocol']]) {
+    const accounts = Array.from({ length: outcomes.length + 1 }, (_, i) => ({ id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
+    const stage = rotationStage({ accounts });
+    const responses = {
+      quota: () => sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]),
+      transient: () => { throw new UpstreamError('synthetic transport failure', { status: 502 }); },
+      protocol: () => sse([frame([{ text: 'partial' }])]),
+    };
+    const { error, calls } = await stage.request([
+      ...outcomes.map((outcome) => responses[outcome]),
+      sse([frame([{ text: 'never reached' }], 'STOP')]),
+    ]);
+    assert.ok(error instanceof UpstreamError);
+    assert.equal(error.kind, 'truncated');
+    assert.equal(error.status, 502);
+    assert.equal(calls, outcomes.length, 'the second protocol failure stops before another healthy account');
+    const cooled = outcomes.filter((outcome) => outcome !== 'protocol').length;
+    assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), accounts
+      .filter((_, index) => outcomes[index] !== 'quota' && outcomes[index] !== 'transient').map((a) => a.id));
+    assert.equal(stage.events.filter((e) => e.event === 'account.cooldown').length, cooled);
+    assert.deepEqual(stage.events.filter((e) => e.event === 'attempt.timing').map((a) => a.outcome), outcomes);
+  }
 });
 
 test('a spent pool keeps the real protocol failure instead of a fabricated quota 429', async () => {
