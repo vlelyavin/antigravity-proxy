@@ -120,8 +120,8 @@ test('a caller that hangs up while the answer is pending cancels the upstream an
     assert.deepEqual(pool.healthy(accounts).map((a) => a.id), ['a0', 'a1'], 'a caller that left is not an upstream failure');
     assert.equal(attempts, 1, 'a cancelled caller never starts another account');
     assert.equal(vertex.calls.length, 0, 'nor does it start the fallback');
-    assert.ok(!events.some((e) => e.event === 'account.cooldown'));
-    assert.ok(!events.some((e) => e.event === 'rotation.transient'));
+    assert.ok(!events.some((e) => e.event === 'pool.restriction'));
+    assert.ok(!events.some((e) => e.event === 'attempt.timing' && e.failureReason && e.failureReason !== 'client_cancelled'));
     const attempt = events.find((e) => e.event === 'attempt.timing');
     assert.equal(attempt.outcome, 'client_abort');
     assert.equal(attempt.account, accountLabel(accounts[0]));

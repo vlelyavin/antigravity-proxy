@@ -1,10 +1,27 @@
 import { antigravityToOpenAi, antigravityChunkToOpenAiChunk } from '../rewrite/openai-translate.js';
-import { abortFailure, UpstreamError, upstreamErrorFromJson } from '../upstream/upstream-client.js';
+import { abortFailure, UpstreamError, upstreamErrorFromJson, generationOf } from '../upstream/upstream-client.js';
 import { generateViaVertexFallback, isGeminiFamily, openAiJsonToStreamFrames } from '../upstream/vertex-fallback.js';
 import { accountLabel } from '../utils/alias.js';
 import { errorCategory } from '../utils/error-category.js';
+import {
+  POLICY_VERSION,
+  annotateFailure,
+  annotatedFailure,
+  describeFailure,
+  failureFields,
+  journalModel,
+  publicFailureText,
+  safeFinishReason,
+} from '../upstream/failure.js';
+import {
+  EGRESS_COOLDOWN_MS,
+  SHARED_FAILURE_BUDGET,
+  decideFailure,
+} from '../upstream/rotation-policy.js';
+import { createDispatchBudget } from '../upstream/dispatch-budget.js';
+import { createCallContext } from './call-context.js';
 
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 export function checkApiKey(config, req) {
   // "none" (string) is a documented no-key value, same as unset
@@ -21,9 +38,13 @@ export function checkApiKey(config, req) {
   return timingSafeEqual(a, b);
 }
 
-export function errorResponse(res, status, message, type = 'invalid_request_error') {
+export function errorResponse(res, status, message, type = 'invalid_request_error', headers = {}) {
   const body = JSON.stringify({ error: { message, type, code: status } });
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+    ...headers,
+  });
   res.end(body);
 }
 
@@ -63,48 +84,107 @@ function attemptCapMs(attemptTimeoutsMs, attempt) {
   return Number.isFinite(value) && value > 0 ? value : Infinity;
 }
 
-/** A caller-supplied id is correlation sugar only: short, printable, no control characters. */
-function requestIdFor(req) {
-  const given = req?.headers?.['x-request-id'];
-  if (typeof given === 'string') {
-    const clean = given.replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 64);
-    if (clean) return clean;
-  }
-  return `req-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
-}
-
 /**
- * Payload-free failure classification for the journal: a structured kind and status, never an
- * upstream message body (those echo prompts), never a token, path or email.
+ * Payload-free failure category for the journal. The structured fields are emitted separately by
+ * `failureFields`; this legacy string keeps the timing lines readable.
  */
-const FAILURE_KINDS = new Set(['other', 'quota', 'auth', 'client_abort', 'deadline', 'terminal',
-  'timeout', 'malformed', 'truncated', 'stream', 'first_frame_timeout', 'idle_timeout',
-  'attempt_timeout', 'request_deadline']);
-
 export function failureReason(error) {
   if (!error) return null;
-  if (error instanceof UpstreamError) {
-    const kind = FAILURE_KINDS.has(error.kind) ? error.kind : 'other';
-    const status = Number.isInteger(error.status) ? error.status : 502;
-    return `${kind}:${status}`;
-  }
+  if (error instanceof UpstreamError) return `${error.kind}:${error.publicStatus}`;
+  const annotated = annotatedFailure(error);
+  if (annotated) return `${annotated.kind}:${annotated.publicStatus}`;
   return errorCategory(error);
 }
 
-// Unusable answers do not prove account failure or justify draining the healthy pool.
-const PROTOCOL_FAILURE_KINDS = new Set(['truncated', 'terminal', 'malformed']);
-const MAX_PROTOCOL_ATTEMPTS = 2;
+function safeEffort(value) {
+  return ['low', 'medium', 'high', 'max', 'xhigh', 'ultra', 'minimal', 'none', 'off'].includes(value)
+    ? value
+    : null;
+}
 
-function isProtocolFailure(error) {
-  return error instanceof UpstreamError && PROTOCOL_FAILURE_KINDS.has(error.kind);
+/** x-agy-reason vocabulary: fixed and safe. */
+export function headerReasonFor(error) {
+  if (!error) return null;
+  switch (describeFailure(error).reason) {
+    case 'rate_limit_unknown_scope':
+    case 'scoped_quota':
+    case 'account_restricted':
+    case 'project_restricted':
+    case 'provider_unavailable':
+      return 'quota';
+    case 'revoked_credential':
+    case 'auth_rejected':
+    case 'auth_rejected_after_refresh':
+      return 'auth';
+    case 'permission_denied':
+      return 'permission';
+    case 'truncated':
+    case 'malformed':
+    case 'empty_response':
+    case 'unsuccessful_terminal':
+      return 'protocol';
+    case 'egress_invalid_config':
+    case 'egress_unavailable':
+    case 'egress_refused':
+      return 'egress';
+    case 'timeout':
+      return 'timeout';
+    case 'deadline':
+      return 'deadline';
+    case 'client_cancelled':
+      return 'client_cancelled';
+    case 'budget_exhausted':
+      return 'budget';
+    case 'invalid_request':
+      return 'invalid_request';
+    case 'invalid_local_config':
+      return 'invalid_config';
+    case 'resource_gated':
+    case 'probe_lost':
+      return 'resource_gated';
+    case 'credential_blocked':
+      return 'credential_blocked';
+    default:
+      return 'transient';
+  }
 }
 
 function clientAbortError() {
-  return new UpstreamError('client disconnected', { status: 499, kind: 'client_abort' });
+  return new UpstreamError('client disconnected', {
+    status: 499, origin: 'caller', phase: 'client', reason: 'client_cancelled', scope: 'request',
+    evidence: 'local_abort', publicStatus: 499, kind: 'client_abort',
+  });
 }
 
 function deadlineError(deadlineMs) {
-  return new UpstreamError(`request deadline of ${deadlineMs}ms exceeded`, { status: 504, kind: 'deadline' });
+  return new UpstreamError(`request deadline of ${deadlineMs}ms exceeded`, {
+    status: 504, origin: 'caller', phase: 'client', reason: 'deadline', scope: 'request',
+    evidence: 'request_deadline', publicStatus: 504, kind: 'deadline',
+  });
+}
+
+function credentialReplacedError(account, generation) {
+  return new UpstreamError('credential material changed before dispatch', {
+    status: 502, origin: 'generation', phase: 'dispatch', reason: 'credential_replaced',
+    scope: 'credential', evidence: 'credential_generation', publicStatus: 502,
+    accountId: account.id, generation,
+  });
+}
+
+function probeLostError(account, generation) {
+  return new UpstreamError('recovery probe ownership lost before dispatch', {
+    status: 503, origin: 'generation', phase: 'dispatch', reason: 'probe_lost',
+    scope: 'request', evidence: 'probe_ownership', publicStatus: 503,
+    accountId: account.id, generation,
+  });
+}
+
+function resourceGatedError(account, gate, generation, projectId) {
+  return new UpstreamError('resolved resource is restricted', {
+    status: 503, origin: 'project', phase: 'project_resolution', reason: 'resource_gated',
+    scope: gate.scope, evidence: 'resolved_gate', publicStatus: 503,
+    accountId: account.id, generation, projectId,
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -142,9 +222,49 @@ function explicitUpstreamError(payload) {
   return payload?.error || payload?.response?.error || null;
 }
 
-function unsuccessfulTerminal(accountId, finishReason) {
-  return new UpstreamError(`upstream finished with an unsuccessful finish reason: ${typeof finishReason === 'string' ? finishReason : 'invalid type'}`, {
-    status: 502, accountId, kind: 'terminal',
+function unsuccessfulTerminal(accountId, finishReason, generation) {
+  return new UpstreamError(
+    `upstream finished with an unsuccessful finish reason: ${safeFinishReason(finishReason)}`,
+    {
+      status: 502, origin: 'protocol', phase: 'stream', reason: 'unsuccessful_terminal',
+      scope: 'request', evidence: 'unsuccessful_terminal', publicStatus: 502,
+      accountId, generation, kind: 'terminal',
+    },
+  );
+}
+
+function malformedFrame(accountId, generation) {
+  return new UpstreamError('upstream sent a malformed SSE frame', {
+    status: 502, origin: 'protocol', phase: 'stream', reason: 'malformed', scope: 'request',
+    evidence: 'sse_json_parse', publicStatus: 502, accountId, generation, kind: 'malformed',
+  });
+}
+
+function truncatedCompletion(accountId, generation) {
+  return new UpstreamError('upstream response ended without a finish reason (truncated)', {
+    status: 502, origin: 'protocol', phase: 'stream', reason: 'truncated', scope: 'request',
+    evidence: 'missing_terminal', publicStatus: 502, accountId, generation, kind: 'truncated',
+  });
+}
+
+function emptyStream(accountId, generation) {
+  return new UpstreamError('upstream stream produced no frames', {
+    status: 502, origin: 'protocol', phase: 'stream', reason: 'empty_response', scope: 'request',
+    evidence: 'stream_no_frames', publicStatus: 502, accountId, generation, kind: 'malformed',
+  });
+}
+
+function malformedBody(accountId, generation, error) {
+  return new UpstreamError('upstream response body was malformed', {
+    status: 502, origin: 'protocol', phase: 'validation', reason: 'malformed', scope: 'request',
+    evidence: 'json_body_parse', publicStatus: 502, accountId, generation, kind: 'malformed', cause: error,
+  });
+}
+
+function malformedShape(accountId, generation) {
+  return new UpstreamError('upstream response body had an unsupported shape', {
+    status: 502, origin: 'protocol', phase: 'validation', reason: 'malformed', scope: 'request',
+    evidence: 'json_body_shape', publicStatus: 502, accountId, generation, kind: 'malformed',
   });
 }
 
@@ -209,19 +329,55 @@ export function createFlowWatchdog({ firstMeaningfulFrameMs, idleMs, onStall }) 
   };
 }
 
+
+function applySharedEffect(pool, decision, { account, generation, context, config, now }) {
+  if (decision.sharedEffect === 'block_credential') {
+    return pool.blockGeneration({
+      account, generation, reason: decision.reason, evidence: decision.evidence,
+    });
+  }
+  if (decision.sharedEffect === 'cool_egress') {
+    if (!context?.egressKey) return { applied: false, effect: 'unknown_egress' };
+    return pool.restrict({
+      account,
+      scope: 'egress',
+      egressKey: context.egressKey,
+      egressAlias: context.egressAlias,
+      until: decision.reason === 'egress_invalid_config' ? null : now + EGRESS_COOLDOWN_MS,
+      reason: decision.reason,
+      evidence: decision.evidence,
+      generation,
+    });
+  }
+  if (decision.sharedEffect === 'cool_scoped') {
+    const until = decision.retryAt ?? now + (config?.rotation?.cooldownMs ?? 60_000);
+    return pool.restrict({
+      account,
+      scope: decision.sharedScope,
+      model: decision.sharedScope === 'account_model' ? context?.model ?? null : null,
+      projectId: decision.sharedScope === 'project' ? context?.projectId ?? null : null,
+      provider: decision.sharedScope === 'provider' ? 'agy' : null,
+      until,
+      reason: decision.reason,
+      evidence: decision.evidence,
+      generation,
+    });
+  }
+  return { applied: false, effect: 'none' };
+}
+
 /**
- * Runs an OpenAI-shaped request through the pool with rotation on quota/auth.
- * attemptTimeoutsMs (header x-attempt-timeouts-ms, non-stream only): the i-th account attempt is
- * capped at attemptTimeoutsMs[i] (the last value repeats), clamped to what is left of the request
- * deadline; the request then moves on to the next account and, once the pool is spent, the Vertex
- * relay answers inside the same budget. A caller that disconnects, or a spent deadline, is not an
- * upstream failure: the account is not cooled down and no further attempt starts.
- * The flow timers (rotation.firstMeaningfulFrameTimeoutMs / rotation.idleTimeoutMs) cut an attempt
- * that holds its socket open without progress; they rotate only while nothing has been written to
- * the caller, because a started client stream can never receive another account's output.
+ * Runs an OpenAI-shaped request through the pool. Request-local avoidance (`tried`) is never mixed
+ * with shared pool state: only a proven scoped decision mutates the pool, and a committed caller
+ * stream is never replayed.
  */
-export async function handleWithRotation({ pool, store, upstream, config, logger, openAiBody, req, res, signal, respondNative = false, attemptTimeoutsMs = [] }) {
-  const requestId = requestIdFor(req);
+export async function handleWithRotation({
+  pool, store, upstream, config, logger, openAiBody, req, res, signal,
+  respondNative = false, attemptTimeoutsMs = [], call = null,
+}) {
+  const ctx = call ?? createCallContext(req, { model: openAiBody.model });
+  ctx.setModel(openAiBody.model);
+  const requestId = ctx.requestId;
   const startedAt = Date.now();
   const deadlineMs = resolveRequestDeadlineMs(config);
   const flowTimeouts = resolveFlowTimeouts(config);
@@ -236,41 +392,86 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
   const outOfTime = () => deadlineReached.signal.aborted || Date.now() >= deadlineAt;
   const requestSignal = signal ? AbortSignal.any([signal, deadlineReached.signal]) : deadlineReached.signal;
 
-  let lastError = null;
   let accounts = [];
+  let storeError = null;
   try {
     accounts = store.readAll();
   } catch (error) {
     // missing/corrupt credential files: the pool is empty — still fall back
-    lastError = error;
+    storeError = error;
   }
-  // 2026-10-19: перебор ВСЕХ аккаунтов, а не трёх. Мари не должна видеть 429,
-  // пока в пуле есть живые аккаунты (7 аккаунтов, 3 попытки = 4 живых простаивали).
-  // 2026-10-25: это правило для квоты и транспорта; протокольный сбой
-  // (truncated/terminal/malformed) ограничен двумя попытками - см. PROTOCOL_FAILURE_KINDS.
-  const maxAttempts = accounts.length;
+  const budget = createDispatchBudget({ credentials: Array.isArray(accounts) ? accounts.length : 0 });
   const tried = new Set();
-  let attempts = 0;
-  let protocolAttempts = 0;
+  const authRetried = new Set();
+  const replacedRetried = new Set();
+
+  const freshGenerationFor = (accountId) => {
+    try {
+      const fresh = store.readAll();
+      const hit = fresh.find((account) => account.id === accountId);
+      return hit ? { known: true, generation: generationOf(hit) } : { known: true, generation: null };
+    } catch {
+      return { known: false, generation: null };
+    }
+  };
+
+  const buildContext = (account, { projectId = null } = {}) => {
+    const egress = typeof upstream.egressIdentityFor === 'function'
+      ? upstream.egressIdentityFor(account)
+      : { key: null, alias: 'direct' };
+    return {
+      generation: generationOf(account),
+      model: journalModel(openAiBody.model) ?? null,
+      egressKey: egress.key,
+      egressAlias: egress.alias,
+      projectId: projectId ?? account.projectId ?? null,
+    };
+  };
+
+  let account = null;
+  let selection = null;
+  let attemptGeneration = null;
+  let attemptContext = null;
+  let retrySame = false;
+  let sharedRemaining = SHARED_FAILURE_BUDGET;
+  let lastError = null;
+  let lastFailure = null;
+  let lastDecision = null;
+  let stopReason = null;
+  let exhaustion = null;
+  let attemptsMade = 0;
+  const attemptFailures = [];
   let requestOutcome = 'failed';
   let status = 502;
 
+  const maxIterations = Math.max(2, accounts.length * 2 + 2);
+
   try {
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // a caller that hung up, or a spent budget, never starts another account
+    for (let iteration = 0; iteration < maxIterations; iteration++) {
       if (clientGone()) { requestOutcome = 'client_abort'; throw clientAbortError(); }
-      if (outOfTime()) { requestOutcome = 'deadline'; lastError = deadlineError(deadlineMs); break; }
-      const account = pool.pick(accounts, tried);
-      if (!account) {
-        // A spent pool must not mask its last real non-quota failure with a fabricated 429.
-        if (!lastError || (lastError instanceof UpstreamError && lastError.kind === 'quota')) {
-          lastError = new UpstreamError('all accounts are cooling down (rate limited)', { status: 429, kind: 'quota' });
-          status = 429;
-        }
+      if (outOfTime()) {
+        lastError = deadlineError(deadlineMs);
+        lastFailure = describeFailure(lastError);
+        requestOutcome = 'deadline';
+        stopReason = 'deadline';
         break;
       }
-      tried.add(account.id);
-      attempts = attempt + 1;
+      if (!retrySame) {
+        selection = pool.select(accounts, { tried, context: (candidate) => buildContext(candidate) });
+        if (!selection.account) {
+          exhaustion = selection;
+          stopReason = 'pool_exhausted';
+          break;
+        }
+        account = selection.account;
+        attemptGeneration = selection.context?.generation ?? generationOf(account);
+        attemptContext = selection.context;
+        tried.add(account.id);
+      }
+      retrySame = false;
+      attemptsMade += 1;
+      budget.recordAttempt();
+      const attempt = attemptsMade - 1;
       const attemptStartedAt = Date.now();
       // The ladder shortens one non-stream attempt (a client-facing stream has no ladder); what is
       // left of the request budget always caps it. Both caps are absolute: a keepalive frame keeps
@@ -286,9 +487,6 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
         : null;
       const attemptSignal = attemptAbort.signal;
       const timing = { startedAt: attemptStartedAt, prepMs: null, firstFrameMs: null };
-      // The flow watchdog exists where there is a frame stream to measure: the client SSE lane and
-      // the SSE collection of a non-stream request. Native buffered generateContent has no frames,
-      // so it keeps only the ladder and the total budget (see README, "native lane").
       const flow = respondNative === true ? null : createFlowWatchdog({
         firstMeaningfulFrameMs: flowTimeouts.firstMeaningfulFrameMs,
         idleMs: flowTimeouts.idleMs,
@@ -300,13 +498,55 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
         )),
       });
       let attemptOutcome = 'error';
+      let decision = null;
       let retry = false;
       let abortCode = null;
+      let stateEffect = null;
+      let attemptFailure = null;
+      let attemptDecision = null;
+
+      logger.info('attempt.start', {
+        requestId,
+        attempt,
+        account: accountLabel(account),
+        stream: openAiBody.stream === true,
+        native: respondNative === true,
+        route: 'agy',
+        modelRequested: ctx.modelRequested,
+        egress: attemptContext?.egressAlias ?? 'direct',
+        policyVersion: POLICY_VERSION,
+      });
+
+      const beforeDispatch = async (meta) => {
+        if (clientGone()) throw clientAbortError();
+        if (outOfTime()) throw deadlineError(deadlineMs);
+        if (meta.outboundModel) ctx.setOutboundModel(meta.outboundModel);
+        if (meta.generation !== attemptGeneration) {
+          throw credentialReplacedError(account, attemptGeneration);
+        }
+        if (!pool.probeAlive(selection)) throw probeLostError(account, attemptGeneration);
+        const fresh = freshGenerationFor(account.id);
+        if (fresh.known && fresh.generation !== attemptGeneration) {
+          throw credentialReplacedError(account, attemptGeneration);
+        }
+        attemptContext = buildContext(account, { projectId: meta.projectId });
+        const gate = typeof pool.gateFor === 'function'
+          ? pool.gateFor(account, attemptContext, selection)
+          : null;
+        if (gate) throw resourceGatedError(account, gate, attemptGeneration, meta.projectId);
+      };
+
       try {
-        if (openAiBody.stream) {
-          await handleStream({ upstream, config, logger, account, openAiBody, res, signal: attemptSignal, timing, flow, requestId });
+        const dispatchOptions = {
+          upstream, logger, account, openAiBody, signal: attemptSignal, timing, flow,
+          requestId, call: ctx, budget, beforeDispatch, generation: attemptGeneration,
+        };
+        if (respondNative === true) {
+          await handleNonStream({ ...dispatchOptions, res, respondNative: true });
+        } else if (openAiBody.stream) {
+          await handleStream({ ...dispatchOptions, res });
         } else {
-          await handleNonStream({ upstream, logger, account, openAiBody, res, signal: attemptSignal, respondNative, timing, flow, requestId });
+          await handleNonStream({ ...dispatchOptions, res, respondNative: false });
         }
         attemptOutcome = 'ok';
       } catch (error) {
@@ -315,69 +555,132 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
           ? attemptAbort.signal.reason.code
           : null;
         if (clientGone()) {
-          // the caller hung up: nothing to cool down and nobody left to answer
           attemptOutcome = 'client_abort';
+          lastFailure = describeFailure(clientAbortError());
+          lastDecision = decideFailure(lastFailure, {});
+          lastDecision.action = 'stop';
+          lastDecision.stopReason = 'client_cancelled';
+          attemptFailure = lastFailure;
+          attemptDecision = lastDecision;
+          retry = false;
         } else if (outOfTime()) {
           attemptOutcome = 'deadline';
           lastError = deadlineError(deadlineMs);
-        } else if (error?.reported === true) {
-          // the client stream already carries the failure frame: nothing may be appended to it and
-          // no other account's output may be mixed into it
-          attemptOutcome = 'stream_failed';
-        } else if (abortCode === 'first_frame_timeout' || abortCode === 'idle_timeout') {
-          // flow-aware cut: the upstream held its socket open without progress
-          attemptOutcome = abortCode;
-          const timeoutMs = abortCode === 'first_frame_timeout' ? flowTimeouts.firstMeaningfulFrameMs : flowTimeouts.idleMs;
-          lastError = new UpstreamError(
-            abortCode === 'first_frame_timeout'
-              ? `upstream sent no meaningful frame within ${timeoutMs}ms`
-              : `upstream stalled for ${timeoutMs}ms after making progress`,
-            { status: 504, accountId: account.id, kind: 'timeout' },
-          );
-          // the next account may answer only while the caller has received nothing yet
-          retry = !res.headersSent;
-        } else if (attemptAbort.signal.aborted) {
-          // a hung upstream: the next untried account gets the rest of the client's patience
-          attemptOutcome = 'attempt_timeout';
-          lastError = new UpstreamError(`upstream attempt timed out after ${attemptMs}ms`, { status: 504, accountId: account.id, kind: 'timeout' });
-          logger.warn('rotation.attempt_timeout', { requestId, account: accountLabel(account), attempt, timeoutMs: attemptMs });
-          retry = true;
-        } else if (error instanceof UpstreamError && error.kind === 'quota') {
-          attemptOutcome = 'quota';
-          pool.cooldown(account.id, config.rotation.cooldownMs, accountLabel(account));
-          logger.warn('rotation.quota', { requestId, account: accountLabel(account), attempt });
-          retry = true;
-        } else if (error instanceof UpstreamError && error.kind === 'auth') {
-          attemptOutcome = 'auth';
-          upstream.invalidate(account.id);
-          logger.warn('rotation.auth', { requestId, account: accountLabel(account), attempt });
-          retry = true;
-        } else if (isProtocolFailure(error) && !res.headersSent) {
-          // A protocol retry must leave shared account health unchanged.
-          attemptOutcome = 'protocol';
-          protocolAttempts += 1;
-          logger.warn('rotation.protocol', {
-            requestId, account: accountLabel(account), attempt, kind: error.kind, protocolAttempts,
+          lastFailure = describeFailure(lastError);
+          lastDecision = decideFailure(lastFailure, {});
+          attemptFailure = lastFailure;
+          attemptDecision = lastDecision;
+          retry = false;
+        } else {
+          const observed = describeFailure(error);
+          const failure = {
+            ...observed,
+            // Local flow/timeout codes stay visible in the legacy journal reason.
+            kind: abortCode ?? observed.kind,
+            accountId: observed.accountId ?? account.id,
+            generation: observed.generation ?? attemptGeneration,
+          };
+          lastFailure = failure;
+          // Keep a plain read/parse error's identity, but carry the classification with it.
+          if (!(error instanceof UpstreamError)) annotateFailure(error, failure);
+          decision = decideFailure(failure, {
+            headersCommitted: res.headersSent === true,
+            authRetryUsed: authRetried.has(account.id),
+            canRetryCredential: budget.canTakeGeneration(account.id),
+            phase: failure.phase,
           });
-          retry = protocolAttempts < MAX_PROTOCOL_ATTEMPTS;
-        } else if (error instanceof UpstreamError && (error.status === 502 || error.status === 504) && !res.headersSent) {
-          // 2026-10-17: transient lane/proxy failures (502/504 before any bytes were written)
-          // must fail over to the next account instead of surfacing a break to the client.
-          // A dead Mullvad lane on the sticky account otherwise aborts every request for
-          // the whole cooldown window.
-          attemptOutcome = 'transient';
-          pool.cooldown(account.id, Math.min(config.rotation.cooldownMs, 60_000), accountLabel(account));
-          logger.warn('rotation.transient', {
-            requestId, account: accountLabel(account), attempt, status: error.status,
-          });
-          retry = true;
+          lastDecision = decision;
+          attemptFailure = failure;
+          attemptDecision = decision;
+          attemptOutcome = error?.reported === true
+            ? 'stream_failed'
+            : (abortCode === 'first_frame_timeout' || abortCode === 'idle_timeout') ? abortCode
+              : abortCode === 'attempt_timeout' ? 'attempt_timeout'
+                : decision.outcome;
+          attemptFailures.push(failure);
+
+          const fresh = freshGenerationFor(account.id);
+          const generationCurrent = !fresh.known
+            || (fresh.generation !== null && fresh.generation === attemptGeneration);
+          if (decision.sharedEffect !== 'none') {
+            stateEffect = generationCurrent
+              ? applySharedEffect(pool, decision, {
+                account, generation: attemptGeneration, context: attemptContext, config, now: Date.now(),
+              })
+              : { applied: false, effect: 'stale_generation' };
+          }
+
+          if (decision.budget === 'shared') {
+            sharedRemaining -= 1;
+            if (sharedRemaining <= 0) {
+              decision.action = 'stop';
+              decision.stopReason = decision.stopReason ?? 'shared_budget_spent';
+            }
+          }
+
+          if (decision.action === 'stop') {
+            retry = false;
+            stopReason = decision.stopReason ?? 'stopped';
+          } else if (decision.action === 'retry_credential') {
+            upstream.forceRefresh?.(account);
+            authRetried.add(account.id);
+            retry = true;
+            retrySame = true;
+          } else if (decision.action === 'retry_replaced') {
+            // No wire dispatch happened: the same path now carries new material. Re-select once.
+            if (replacedRetried.has(account.id)) {
+              retry = false;
+              decision.stopReason = 'credential_replaced_again';
+            } else {
+              replacedRetried.add(account.id);
+              tried.delete(account.id);
+              retry = true;
+              retrySame = false;
+            }
+          } else {
+            retry = true;
+            retrySame = false;
+          }
         }
       } finally {
         flow?.dispose();
         requestSignal.removeEventListener('abort', forwardAbort);
         if (attemptTimer) clearTimeout(attemptTimer);
       }
-      // a flow stall is one category whether or not it could still rotate
+
+      status = attemptOutcome === 'ok'
+        ? 200
+        : (attemptOutcome === 'client_abort' ? null : (attemptFailure?.publicStatus ?? 502));
+      logger.info('attempt.timing', {
+        requestId,
+        attempt,
+        account: accountLabel(account),
+        stream: openAiBody.stream === true,
+        native: respondNative === true,
+        outcome: attemptOutcome,
+        status,
+        observedStatus: attemptFailure?.observedStatus ?? null,
+        reason: attemptFailure ? `${attemptFailure.kind}:${attemptFailure.publicStatus}` : null,
+        ...(attemptFailure ? failureFields(attemptFailure) : {}),
+        decision: attemptDecision?.action ?? null,
+        decisionReason: attemptDecision?.reason ?? null,
+        policyVersion: POLICY_VERSION,
+        sharedEffect: stateEffect?.effect ?? 'none',
+        sharedScope: attemptDecision?.sharedScope ?? null,
+        retry: retry === true,
+        stopReason: attemptDecision?.stopReason ?? null,
+        modelRequested: ctx.modelRequested,
+        modelOutbound: ctx.modelOutbound,
+        modelReported: ctx.modelReported,
+        egress: attemptContext?.egressAlias ?? 'direct',
+        generationPost: budget.displacementFor(account.id).generation,
+        oauthPost: budget.displacementFor(account.id).oauth,
+        projectPost: budget.displacementFor(account.id).project,
+        prepMs: timing.prepMs,
+        firstFrameMs: timing.firstFrameMs,
+        totalMs: Date.now() - attemptStartedAt,
+      });
+
       if ((attemptOutcome === abortCode || attemptOutcome === 'stream_failed')
         && (abortCode === 'first_frame_timeout' || abortCode === 'idle_timeout')) {
         logger.warn('rotation.stall', {
@@ -387,85 +690,239 @@ export async function handleWithRotation({ pool, store, upstream, config, logger
           kind: abortCode,
           timeoutMs: abortCode === 'first_frame_timeout' ? flowTimeouts.firstMeaningfulFrameMs : flowTimeouts.idleMs,
           rotatable: attemptOutcome === abortCode,
+          policyVersion: POLICY_VERSION,
         });
       }
-      status = attemptOutcome === 'ok' ? 200 : (attemptOutcome === 'client_abort' ? null : (lastError instanceof UpstreamError ? lastError.status : 502));
-      logger.info('attempt.timing', {
-        requestId,
-        attempt,
-        account: accountLabel(account),
-        stream: openAiBody.stream === true,
-        outcome: attemptOutcome,
-        status,
-        reason: attemptOutcome === 'ok' ? null : (attemptOutcome === 'client_abort' ? 'client_disconnected' : failureReason(lastError)),
-        prepMs: timing.prepMs,
-        firstFrameMs: timing.firstFrameMs,
-        totalMs: Date.now() - attemptStartedAt,
-      });
-      if (attemptOutcome === 'ok') { requestOutcome = 'ok'; return; }
-      if (attemptOutcome === 'client_abort') throw lastError;
-      if (!retry) break;
+
+      if (attemptOutcome === 'ok') {
+        pool.recoverProbe(selection, { generation: attemptGeneration });
+        requestOutcome = 'ok';
+        status = 200;
+        ctx.finish({ route: 'agy', reason: null });
+        return;
+      }
+      if (attemptOutcome === 'client_abort') {
+        pool.releaseProbe(selection);
+        throw lastError;
+      }
+      if (!retry) {
+        pool.releaseProbe(selection);
+        break;
+      }
+      if (retrySame) {
+        // The recovery-probe lease spans the forced-auth retry of the same credential.
+        continue;
+      }
+      pool.releaseProbe(selection);
+      account = null;
+      selection = null;
     }
+
+    if (!stopReason && !exhaustion) stopReason = 'iteration_bound';
 
     // Pool exhausted: last-resort Vertex relay before giving up, inside the same budget.
     if (!clientGone() && !outOfTime()
-      && await tryVertexFallback({ config, logger, openAiBody, res, signal: requestSignal, deadlineAt, respondNative, lastError, requestId })) {
+      && await tryVertexFallback({ config, logger, openAiBody, res, signal: requestSignal, deadlineAt, respondNative, lastError, requestId, call: ctx, budget })) {
       requestOutcome = 'vertex_fallback';
       status = 200;
       return;
     }
     if (clientGone()) { requestOutcome = 'client_abort'; throw clientAbortError(); }
     if (outOfTime()) { requestOutcome = 'deadline'; throw deadlineError(deadlineMs); }
-    throw lastError ?? new UpstreamError('no accounts available', { status: 502 });
+
+    const finalError = finalPoolError({
+      storeError, accounts, exhaustion, attemptFailures, lastError, lastFailure, stopReason,
+    });
+    ctx.syncFromBudget(budget);
+    ctx.finish({ reason: headerReasonFor(finalError), stopReason: lastDecision?.stopReason ?? stopReason });
+    throw finalError;
   } catch (error) {
+    ctx.syncFromBudget(budget);
     if (clientGone()) {
       requestOutcome = 'client_abort';
       status = null; // nobody is left to receive a status
     } else {
       requestOutcome = outOfTime() ? 'deadline' : 'failed';
-      status = error instanceof UpstreamError ? error.status : (error.status === 400 ? 400 : 502);
+      const finalFailure = describeFailure(error);
+      status = error instanceof UpstreamError
+        ? error.publicStatus
+        : (Number.isInteger(finalFailure?.publicStatus) ? finalFailure.publicStatus : (error.status === 400 ? 400 : 502));
+      ctx.finish({ reason: headerReasonFor(error), stopReason: lastDecision?.stopReason ?? stopReason });
     }
     throw error;
   } finally {
+    // Last-resort lease release: every normal path releases earlier, this covers an exception
+    // between selection and the attempt-level cleanup. Recovery never happens on release.
+    if (selection && typeof pool.releaseProbe === 'function') pool.releaseProbe(selection);
     clearTimeout(deadlineTimer);
     logger.info('request.timing', {
-      requestId, outcome: requestOutcome, status, attempts,
+      requestId,
+      outcome: requestOutcome,
+      status,
+      attempts: budget.counts().accountAttempts,
+      generationPosts: budget.counts().generation,
+      oauthPosts: budget.counts().oauth,
+      projectPosts: budget.counts().project,
+      refreshJoins: budget.counts().refreshJoins,
+      maxGenerationPosts: budget.counts().maxGeneration,
       reason: requestOutcome === 'ok' ? null : (requestOutcome === 'client_abort' ? 'client_disconnected' : failureReason(lastError)),
-      totalMs: Date.now() - startedAt, deadlineMs,
+      totalMs: Date.now() - startedAt,
+      deadlineMs,
+      route: ctx.route,
+      policyVersion: POLICY_VERSION,
+      stopReason: ctx.stopReason ?? stopReason,
+      exhausted: exhaustion ? {
+        tried: exhaustion.counts.tried,
+        credentialBlocked: exhaustion.counts.credentialBlocked,
+        quotaGated: exhaustion.counts.quotaGated,
+        egressGated: exhaustion.counts.egressGated,
+        resourceGated: exhaustion.counts.resourceGated,
+        probeBusy: exhaustion.counts.probeBusy,
+      } : null,
     });
   }
 }
 
+/**
+ * The final response must describe what actually happened. A fabricated 429 is never produced
+ * because selection returned null: 429 needs quota evidence explaining every candidate, and mixed,
+ * unknown or blocked pools answer with an explicit service failure.
+ */
+function finalPoolError({ storeError, accounts, exhaustion, attemptFailures, lastError, lastFailure, stopReason }) {
+  if (storeError) {
+    return new UpstreamError('no upstream credentials are available', {
+      status: 503, origin: 'local', phase: 'credential_load', reason: 'invalid_local_config',
+      scope: 'request', evidence: 'unclassified_error', publicStatus: 503,
+    });
+  }
+  if (accounts.length === 0) {
+    return new UpstreamError('no upstream credentials are available', {
+      status: 503, origin: 'local', phase: 'credential_load', reason: 'invalid_local_config',
+      scope: 'request', evidence: 'unclassified_error', publicStatus: 503,
+    });
+  }
+  if (exhaustion) {
+    const exclusions = exhaustion.exclusions ?? [];
+    const quotaOnly = exclusions.length > 0
+      && exclusions.every((entry) => entry.code === 'quota_gated')
+      && (attemptFailures.length === 0 || attemptFailures.every((failure) => failure.reason === 'rate_limit_unknown_scope'
+        || failure.reason === 'scoped_quota'
+        || failure.reason === 'account_restricted'
+        || failure.reason === 'project_restricted'
+        || failure.reason === 'provider_unavailable'));
+    if (lastError) {
+      // A real observed failure is kept unless turning it into 429 would misdescribe a mixed pool:
+      // another observed failure, or an exclusion reason that is not an observed 429/quota gate.
+      const mixedExclusions = exclusions.some((entry) => entry.code !== 'tried' && entry.code !== 'quota_gated');
+      const mixedAfterRateLimit = lastFailure?.reason === 'rate_limit_unknown_scope'
+        && (attemptFailures.some((failure) => failure.reason !== 'rate_limit_unknown_scope') || mixedExclusions);
+      if (!mixedAfterRateLimit) {
+        if (lastError.reason === 'rate_limit_unknown_scope') {
+          const untils = attemptFailures.map((failure) => failure.retryAt).filter((until) => Number.isFinite(until));
+          if (untils.length > 0) {
+            // The earliest observed eligibility time, not a local cooldown guess.
+            lastError.retryAt = Math.min(...untils);
+            lastError.retryAtSource = 'retry_after';
+          }
+        }
+        return lastError;
+      }
+      return new UpstreamError('upstream attempts ended with mixed failures', {
+        status: 503, origin: 'local', phase: 'dispatch', reason: 'unknown',
+        scope: 'request', evidence: 'pool_gate', publicStatus: 503,
+      });
+    }
+    if (quotaOnly) {
+      const untils = exclusions.map((entry) => entry.until).filter((until) => Number.isFinite(until));
+      const retryAt = untils.length === exclusions.length ? Math.min(...untils) : null;
+      return new UpstreamError('no eligible upstream account: quota gate', {
+        status: 429, origin: 'generation', phase: 'dispatch', reason: 'account_restricted',
+        scope: 'account', evidence: 'pool_gate', publicStatus: 429,
+        retryAt, retryAtSource: retryAt ? 'retry_after' : null,
+      });
+    }
+    if (exclusions.length > 0 && exclusions.every((entry) => entry.code === 'credential_blocked')) {
+      return new UpstreamError('no eligible upstream credential', {
+        status: 503, origin: 'oauth', phase: 'refresh', reason: 'credential_blocked',
+        scope: 'credential', evidence: 'oauth_invalid_grant', publicStatus: 503,
+      });
+    }
+    if (exclusions.length > 0 && exclusions.every((entry) => entry.code === 'egress_gated')) {
+      return new UpstreamError('no eligible upstream account: egress gate', {
+        status: 503, origin: 'egress', phase: 'connect', reason: 'egress_unavailable',
+        scope: 'egress', evidence: 'egress_connect', publicStatus: 503,
+      });
+    }
+    if (exclusions.length > 0 && exclusions.every((entry) => entry.code === 'probe_busy')) {
+      return new UpstreamError('no eligible upstream account: recovery probe is busy', {
+        status: 503, origin: 'generation', phase: 'dispatch', reason: 'probe_lost',
+        scope: 'request', evidence: 'probe_ownership', publicStatus: 503,
+      });
+    }
+    return new UpstreamError('no eligible upstream account', {
+      status: 503, origin: 'local', phase: 'dispatch', reason: 'unknown',
+      scope: 'request', evidence: 'pool_gate', publicStatus: 503,
+    });
+  }
+  if (stopReason === 'deadline') {
+    return lastError ?? new UpstreamError('request deadline exceeded', {
+      status: 504, origin: 'caller', phase: 'client', reason: 'deadline', scope: 'request',
+      evidence: 'request_deadline', publicStatus: 504, kind: 'deadline',
+    });
+  }
+  if (stopReason === 'shared_budget_spent'
+    && attemptFailures.some((failure) => failure.reason === 'rate_limit_unknown_scope')
+    && attemptFailures.some((failure) => failure.reason !== 'rate_limit_unknown_scope')) {
+    // Mixed failures are not a proven quota exhaustion.
+    return new UpstreamError('upstream attempts ended with mixed failures', {
+      status: 503, origin: 'local', phase: 'dispatch', reason: 'unknown', scope: 'request',
+      evidence: 'pool_gate', publicStatus: 503,
+    });
+  }
+  if (lastError) return lastError;
+  return new UpstreamError('upstream request failed', {
+    status: 503, origin: 'local', phase: 'dispatch', reason: 'unknown', scope: 'request',
+    evidence: 'unclassified_error', publicStatus: 503,
+  });
+}
+
 /** Last-resort relay to the local Vertex proxy when every antigravity account failed. */
-async function tryVertexFallback({ config, logger, openAiBody, res, signal, deadlineAt, respondNative, lastError, requestId }) {
+async function tryVertexFallback({ config, logger, openAiBody, res, signal, deadlineAt, respondNative, lastError, requestId, call, budget }) {
   const fb = config.fallback;
   if (!fb?.enabled || !fb.vertexUrl || respondNative || res.headersSent) return false;
+  // Caller input and local configuration are not the pool being exhausted; never mask them with
+  // another endpoint.
+  if (describeFailure(lastError).reason === 'invalid_request'
+    || describeFailure(lastError).reason === 'invalid_local_config') return false;
   if (!isGeminiFamily(openAiBody.model)) return false;
   // the fallback gets what is left of the request budget, never a fresh timeout of its own
   const remainingMs = deadlineAt - Date.now();
   if (!(remainingMs > 0)) return false;
   const timeoutMs = Math.min(Number.isFinite(fb.timeoutMs) && fb.timeoutMs > 0 ? fb.timeoutMs : remainingMs, remainingMs);
-  logger.warn('vertex_fallback.attempt', { requestId, model: openAiBody.model, poolError: failureReason(lastError) });
+  logger.warn('vertex_fallback.attempt', { requestId, model: call?.modelRequested ?? 'unknown', poolError: failureReason(lastError) });
   try {
     const json = await generateViaVertexFallback({
       openAiBody, vertexUrl: fb.vertexUrl, timeoutMs, signal,
     });
+    call?.syncFromBudget?.(budget);
+    call?.finish?.({ route: 'vertex_fallback', reason: null });
+    const headers = call?.headers?.() ?? {};
     if (openAiBody.stream) {
       const body = openAiJsonToStreamFrames(json, openAiBody.model);
       res.writeHead(200, {
         'content-type': 'text/event-stream', 'cache-control': 'no-cache',
-        connection: 'keep-alive', 'content-length': Buffer.byteLength(body),
+        connection: 'keep-alive', 'content-length': Buffer.byteLength(body), ...headers,
       });
       res.end(body);
     } else {
       const body = JSON.stringify(json);
-      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers });
       res.end(body);
     }
-    logger.warn('vertex_fallback.ok', { requestId, model: openAiBody.model });
+    logger.warn('vertex_fallback.ok', { requestId, model: call?.modelRequested ?? 'unknown', route: 'vertex_fallback' });
     return true;
   } catch (error) {
-    logger.warn('vertex_fallback.failed', { requestId, model: openAiBody.model, reason: failureReason(error) });
+    logger.warn('vertex_fallback.failed', { requestId, model: call?.modelRequested ?? 'unknown', reason: failureReason(error) });
     return false;
   }
 }
@@ -487,16 +944,6 @@ async function* sseLines(body) {
   }
   buffer += decoder.decode();
   if (buffer !== '') yield buffer.replace(/\r$/, '');
-}
-
-function malformedFrame(accountId) {
-  return new UpstreamError('upstream sent a malformed SSE frame', { status: 502, accountId, kind: 'malformed' });
-}
-
-function truncatedCompletion(accountId) {
-  return new UpstreamError('upstream response ended without a finish reason (truncated)', {
-    status: 502, accountId, kind: 'truncated',
-  });
 }
 
 // Fixed counters distinguish rejected response shapes without retaining payloads.
@@ -553,8 +1000,34 @@ async function collectCompletion(options) {
   }
 }
 
-async function collectFrames({ upstream, openAiBody, account, signal, model, timing, flow }, shape) {
-  const upstreamResponse = await upstream.generateStream({ openAiBody, account, signal });
+async function readJsonBody(upstreamResponse, account, generation) {
+  try {
+    return await upstreamResponse.json();
+  } catch (error) {
+    throw malformedBody(account.id, generation, error);
+  }
+}
+
+function validateNativeBody(json, account, generation) {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) throw malformedShape(account.id, generation);
+  const explicitError = explicitUpstreamError(json);
+  if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
+  const wrapper = json?.response ?? json;
+  const blocked = Boolean(wrapper?.promptFeedback?.blockReason) && !wrapper?.candidates?.length;
+  const terminal = rawFinishReason(json);
+  if (terminal !== null && !isSuccessfulTerminal(terminal)) {
+    throw unsuccessfulTerminal(account.id, terminal, generation);
+  }
+  // A prompt-level refusal is a documented successful outcome; a candidate without a terminal is not.
+  if (terminal === null && !blocked) throw truncatedCompletion(account.id, generation);
+  return wrapper;
+}
+
+async function collectFrames(options, shape) {
+  const { upstream, openAiBody, account, signal, model, timing, flow, generation, budget, beforeDispatch, requestId } = options;
+  const upstreamResponse = await upstream.generateStream({
+    openAiBody, account, signal, budget, beforeDispatch, requestId,
+  });
   timing.prepMs = Date.now() - timing.startedAt;
   // апстрим иногда отвечает обычным JSON даже на sse-эндпоинт: не ломаемся.
   // Обёртки без headers/body (mari-router) тоже встречаются - проверяем мягко.
@@ -562,18 +1035,18 @@ async function collectFrames({ upstream, openAiBody, account, signal, model, tim
   const type = hasHeaders ? upstreamResponse.headers.get("content-type") || "" : "";
   const hasStream = upstreamResponse.body && typeof upstreamResponse.body[Symbol.asyncIterator] === "function";
   if ((hasHeaders && !type.includes("text/event-stream")) || !hasStream) {
-    const json = await upstreamResponse.json();
+    const json = await readJsonBody(upstreamResponse, account, generation);
     shape.endClass = 'clean';
     observeFrameShape(json, shape);
     // an upstream error object is a failure, not an empty completion - bare or wrapped
     const explicitError = explicitUpstreamError(json);
-    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id);
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
     const wrapper = json?.response ?? json;
     const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
     const terminal = rawFinishReason(json);
-    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
+    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal, generation);
     // a documented refusal or an explicit successful terminal, never the translate default
-    if (terminal === null && !blocked) throw truncatedCompletion(account.id);
+    if (terminal === null && !blocked) throw truncatedCompletion(account.id, generation);
     return antigravityToOpenAi(json, { model });
   }
   const indexRef = { count: 0, first: true };
@@ -593,13 +1066,13 @@ async function collectFrames({ upstream, openAiBody, account, signal, model, tim
     const payload = line.slice(5).trim();
     if (!payload || payload === '[DONE]') return;
     let frame;
-    try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id); }
+    try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id, generation); }
     observeFrameShape(frame, shape);
     // an explicit upstream error is a failure, not a keepalive - bare or in the response wrapper
     const explicitError = explicitUpstreamError(frame);
-    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id);
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
     const terminal = rawFinishReason(frame);
-    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
+    if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal, generation);
     const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
     if (hasSignatureProgress(frame) || isMeaningfulChunk(out)) {
       // only real progress counts for the flow timers: a keepalive never satisfies the first wait
@@ -639,12 +1112,12 @@ async function collectFrames({ upstream, openAiBody, account, signal, model, tim
   shape.endClass = 'clean';
 
   if (id === null && !content && !reasoning && toolCalls.size === 0) {
-    throw new Error('upstream stream produced no frames');
+    throw emptyStream(account.id, generation);
   }
   // A finished generation always carries a finishReason. Without one the body was cut short:
   // answering "stop" here handed the client a truncated answer as a complete one.
   if (finishReason === null) {
-    throw truncatedCompletion(account.id);
+    throw truncatedCompletion(account.id, generation);
   }
 
   const message = { role: 'assistant', content: content || (toolCalls.size ? null : '') };
@@ -670,18 +1143,27 @@ async function collectFrames({ upstream, openAiBody, account, signal, model, tim
   };
 }
 
-async function handleNonStream({ upstream, logger, account, openAiBody, res, signal, respondNative = false, timing, flow, requestId }) {
+async function handleNonStream({
+  upstream, logger, account, openAiBody, res, signal, respondNative = false,
+  timing, flow, requestId, call, budget, beforeDispatch, generation,
+}) {
   if (!respondNative) {
     const openAiJson = await collectCompletion({
-      upstream, logger, requestId, openAiBody, account, signal, model: openAiBody.model, timing, flow,
+      upstream, logger, requestId, openAiBody, account, signal, model: openAiBody.model,
+      timing, flow, call, budget, beforeDispatch, generation,
     });
+    call?.syncFromBudget?.(budget);
     const body = JSON.stringify(openAiJson);
-    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      ...(call?.headers?.() ?? {}),
+    });
     res.end(body);
     logger.info('chat.completed', {
       requestId,
-      model: openAiBody.model,
-      effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
+      model: call?.modelRequested ?? 'unknown',
+      effort: safeEffort(openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort),
       account: accountLabel(account),
       promptTokens: openAiJson.usage.prompt_tokens,
       cachedTokens: openAiJson.usage.prompt_tokens_details?.cached_tokens ?? 0,
@@ -691,22 +1173,30 @@ async function handleNonStream({ upstream, logger, account, openAiBody, res, sig
     return;
   }
   // Native buffered lane: generateContent, one JSON body, no frames to measure. The first-frame and
-  // idle timers deliberately do not apply here (nothing tells a JSON chunk from a keepalive); the
-  // legacy attempt ladder and the request budget are its only caps. See README.
-  const upstreamResponse = await upstream.generate({ openAiBody, account, signal });
+  // idle timers deliberately do not apply here; the legacy attempt ladder and the request budget are
+  // its only caps. Explicit-error and terminal validation now match the SSE collection.
+  const upstreamResponse = await upstream.generate({
+    openAiBody, account, signal, budget, beforeDispatch, requestId,
+  });
   timing.prepMs = Date.now() - timing.startedAt;
-  const json = await upstreamResponse.json();
+  const json = await readJsonBody(upstreamResponse, account, generation);
+  const wrapper = validateNativeBody(json, account, generation);
   const { antigravityToGeminiNative } = await import('../rewrite/gemini-native.js');
   const nativeJson = antigravityToGeminiNative(json);
+  call?.syncFromBudget?.(budget);
   const body = JSON.stringify(nativeJson);
-  res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.writeHead(200, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+    ...(call?.headers?.() ?? {}),
+  });
   res.end(body);
   logger.info('native.completed', {
     requestId,
-    model: openAiBody.model,
-    effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
+    model: call?.modelRequested ?? 'unknown',
+    effort: safeEffort(openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort),
     account: accountLabel(account),
-    blocked: Boolean(nativeJson?.promptFeedback?.blockReason),
+    blocked: Boolean(wrapper?.promptFeedback?.blockReason),
   });
 }
 
@@ -733,29 +1223,44 @@ function drainOrAbort(res, signal) {
  * The client stream already carries the failure: it is reported to the caller of the attempt as a
  * failure of the request, but it must not be appended to (no second account's output, no retry).
  */
-function reportedStreamFailure(error, accountId) {
+function reportedStreamFailure(error, accountId, generation) {
   if (error instanceof UpstreamError) {
     error.reported = true;
+    if (error.generation == null) error.generation = generation;
     return error;
   }
   const code = typeof error?.code === 'string' ? error.code : null;
   const timedOut = code === 'first_frame_timeout' || code === 'idle_timeout' || code === 'attempt_timeout' || code === 'request_deadline';
-  const wrapped = new UpstreamError(error?.message ?? 'upstream stream failed', {
+  const wrapped = new UpstreamError('upstream stream failed', {
     status: timedOut ? 504 : 502,
+    origin: 'protocol',
+    phase: 'stream',
+    reason: timedOut ? 'timeout' : 'unknown',
+    scope: 'request',
+    evidence: 'unclassified_error',
+    publicStatus: timedOut ? 504 : 502,
     accountId,
+    generation,
     kind: timedOut ? code : 'stream',
   });
   wrapped.reported = true;
   return wrapped;
 }
 
-async function handleStream({ upstream, logger, account, openAiBody, res, signal, timing, flow, requestId }) {
-  const upstreamResponse = await upstream.generateStream({ openAiBody, account, signal });
+async function handleStream({
+  upstream, logger, account, openAiBody, res, signal, timing, flow, requestId,
+  call, budget, beforeDispatch, generation,
+}) {
+  const upstreamResponse = await upstream.generateStream({
+    openAiBody, account, signal, budget, beforeDispatch, requestId,
+  });
   timing.prepMs = Date.now() - timing.startedAt;
+  call?.syncFromBudget?.(budget);
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
     connection: 'keep-alive',
+    ...(call?.headers?.() ?? {}),
   });
   const indexRef = { count: 0, first: true };
 
@@ -771,13 +1276,13 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
       const payload = line.slice(5).trim();
       if (!payload || payload === '[DONE]') continue;
       let frame;
-      try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id); }
+      try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id, generation); }
       // an explicit upstream error is a failure, not a quietly finished answer - bare or wrapped
       const explicitError = explicitUpstreamError(frame);
-      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id);
+      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation });
       const terminal = rawFinishReason(frame);
       // an unsuccessful or unknown terminal must never reach the client as a clean stop
-      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal);
+      if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, terminal, generation);
       const openAiChunk = antigravityChunkToOpenAiChunk(frame, { model: openAiBody.model, indexRef });
       if (hasSignatureProgress(frame) || isMeaningfulChunk(openAiChunk)) {
         timing.firstFrameMs ??= Date.now() - timing.startedAt;
@@ -793,7 +1298,7 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
     }
     // A generation ends with an explicit terminal frame. A body that just stops must not be turned
     // into a success-only [DONE]: the caller would take a truncated answer as a complete one.
-    if (!terminalSeen) throw truncatedCompletion(account.id);
+    if (!terminalSeen) throw truncatedCompletion(account.id, generation);
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (error) {
@@ -801,19 +1306,25 @@ async function handleStream({ upstream, logger, account, openAiBody, res, signal
   }
   if (failed) {
     logger.warn('stream.failed', {
-      requestId, model: openAiBody.model, account: accountLabel(account), reason: failureReason(failed),
+      requestId,
+      model: call?.modelRequested ?? 'unknown',
+      account: accountLabel(account),
+      reason: failureReason(failed),
+      ...failureFields(describeFailure(failed)),
     });
     if (!res.writableEnded && !res.destroyed) {
-      res.write(`data: ${JSON.stringify({ error: { message: `upstream stream failed: ${failed.message}`, type: 'server_error' } })}\n\n`);
+      const detail = failed instanceof UpstreamError ? failed.message : publicFailureText(describeFailure(failed).reason);
+      const message = `upstream stream failed: ${detail} (ref ${requestId})`;
+      res.write(`data: ${JSON.stringify({ error: { message, type: 'server_error' } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
     }
-    throw reportedStreamFailure(failed, account.id);
+    throw reportedStreamFailure(failed, account.id, generation);
   }
   logger.info('chat.streamed', {
     requestId,
-    model: openAiBody.model,
-    effort: openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort ?? null,
+    model: call?.modelRequested ?? 'unknown',
+    effort: safeEffort(openAiBody.reasoning_effort ?? openAiBody.reasoning?.effort),
     account: accountLabel(account),
     blocked,
   });

@@ -164,13 +164,13 @@ test('a protocol failure fails the attempt, gets one alternate account and cools
     assert.equal(raw.choices[0].message.content, 'second account', kind);
     // the answer was unusable, the account was not: one alternate, nobody cooled
     assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a0', 'a1'], `${kind} cools nobody`);
-    assert.ok(!events.some((e) => e.event === 'account.cooldown'), kind);
+    assert.ok(!events.some((e) => e.event === 'pool.restriction'), kind);
     const attempts = events.filter((e) => e.event === 'attempt.timing');
     assert.deepEqual(attempts.map((a) => a.outcome), ['protocol', 'ok'], kind);
     assert.equal(attempts[0].reason, `${kind}:502`, 'the journal carries the protocol category');
-    const line = events.find((e) => e.event === 'rotation.protocol');
-    assert.equal(line.kind, kind);
-    assert.equal(line.protocolAttempts, 1);
+    const first = events.filter((e) => e.event === 'attempt.timing')[0];
+    assert.equal(first.failureReason, kind === 'terminal' ? 'unsuccessful_terminal' : kind);
+    assert.equal(first.decision, 'alternate');
   }
 });
 
@@ -185,7 +185,7 @@ test('six truncating accounts stop after two protocol attempts, cool nobody, and
   assert.equal(first.error.status, 502, 'the caller sees the protocol failure, not a fabricated 429');
   assert.equal(first.calls, 2, 'one alternate account, not six');
   assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), accounts.map((a) => a.id), 'all six accounts stay healthy');
-  assert.ok(!stage.events.some((e) => e.event === 'account.cooldown'), 'no cooldown at all');
+  assert.ok(!stage.events.some((e) => e.event === 'pool.restriction'), 'no shared state at all');
   const attempts = stage.events.filter((e) => e.event === 'attempt.timing');
   assert.deepEqual(attempts.map((a) => a.outcome), ['protocol', 'protocol']);
   assert.deepEqual(attempts.map((a) => a.reason), ['truncated:502', 'truncated:502']);
@@ -202,29 +202,51 @@ test('six truncating accounts stop after two protocol attempts, cool nobody, and
   assert.equal(second.calls, 1);
 });
 
-test('mixed quota and transport failures keep their cooldown policy and do not spend protocol attempts', async () => {
-  for (const outcomes of [['quota', 'protocol', 'protocol'], ['protocol', 'transient', 'quota', 'protocol']]) {
-    const accounts = Array.from({ length: outcomes.length + 1 }, (_, i) => ({ id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
+test('unknown, protocol and transient failures share one two-attempt failed-account budget', async () => {
+  const responses = {
+    rate_limited: () => sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]),
+    transient: () => { throw new UpstreamError('synthetic transport failure', {
+      status: 502, origin: 'generation', reason: 'endpoint_unavailable', scope: 'request', evidence: 'http_5xx', publicStatus: 502,
+    }); },
+    protocol: () => sse([frame([{ text: 'partial' }])]),
+  };
+  // The second shared failure stops the request; there is no separate multiplying protocol budget.
+  for (const [outcomes, expectedOutcomes] of [
+    [['rate_limited', 'protocol'], ['rate_limited', 'protocol']],
+    [['transient', 'protocol'], ['transient', 'protocol']],
+    [['protocol', 'protocol'], ['protocol', 'protocol']],
+    [['rate_limited', 'transient'], ['rate_limited', 'transient']],
+  ]) {
+    const accounts = Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, email: `mixed${i}@example.com`, projectId: 'p' }));
     const stage = rotationStage({ accounts });
-    const responses = {
-      quota: () => sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]),
-      transient: () => { throw new UpstreamError('synthetic transport failure', { status: 502 }); },
-      protocol: () => sse([frame([{ text: 'partial' }])]),
-    };
     const { error, calls } = await stage.request([
       ...outcomes.map((outcome) => responses[outcome]),
       sse([frame([{ text: 'never reached' }], 'STOP')]),
     ]);
     assert.ok(error instanceof UpstreamError);
-    assert.equal(error.kind, 'truncated');
-    assert.equal(error.status, 502);
-    assert.equal(calls, outcomes.length, 'the second protocol failure stops before another healthy account');
-    const cooled = outcomes.filter((outcome) => outcome !== 'protocol').length;
-    assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), accounts
-      .filter((_, index) => outcomes[index] !== 'quota' && outcomes[index] !== 'transient').map((a) => a.id));
-    assert.equal(stage.events.filter((e) => e.event === 'account.cooldown').length, cooled);
-    assert.deepEqual(stage.events.filter((e) => e.event === 'attempt.timing').map((a) => a.outcome), outcomes);
+    assert.equal(calls, 2, `two shared failures stop before a third account: ${outcomes.join(',')}`);
+    assert.deepEqual(stage.events.filter((e) => e.event === 'attempt.timing').map((a) => a.outcome), expectedOutcomes);
+    assert.deepEqual(stage.pool.healthy(accounts).map((a) => a.id), accounts.map((a) => a.id), 'nobody is cooled');
+    assert.ok(!stage.events.some((e) => e.event === 'pool.restriction'));
+    assert.equal(stage.events.find((e) => e.event === 'request.timing').stopReason, 'shared_budget_spent');
   }
+});
+
+test('an all-429 shared-budget stop stays 429, while a mixed stop is an explicit service failure', async () => {
+  const accounts = Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, email: `mix${i}@example.com`, projectId: 'p' }));
+  const rateLimited = () => sse([{ error: { code: 429, message: 'quota exceeded', status: 'RESOURCE_EXHAUSTED' } }]);
+  const all429 = rotationStage({ accounts });
+  const first = await all429.request([rateLimited, rateLimited, rateLimited]);
+  assert.ok(first.error instanceof UpstreamError);
+  assert.equal(first.error.publicStatus, 429, 'every observed attempt was a real 429');
+  const mixed = rotationStage({ accounts });
+  const second = await mixed.request([
+    rateLimited,
+    () => sse([frame([{ text: 'partial' }])]),
+    rateLimited,
+  ]);
+  assert.ok(second.error instanceof UpstreamError);
+  assert.equal(second.error.publicStatus, 503, 'a mixed history is not a proven quota exhaustion');
 });
 
 test('a spent pool keeps the real protocol failure instead of a fabricated quota 429', async () => {
@@ -233,7 +255,10 @@ test('a spent pool keeps the real protocol failure instead of a fabricated quota
     { id: 'a1', email: 'pool1@example.com', projectId: 'p' },
   ];
   const stage = rotationStage({ accounts });
-  stage.pool.cooldown('a1', 60_000); // a1 is already cooling after its own genuine 429
+  stage.pool.restrict({
+    accountId: 'a1', scope: 'account', until: Date.now() + 60_000,
+    reason: 'account_restricted', evidence: 'pool_gate',
+  });
 
   const { error, calls } = await stage.request([sse([frame([{ text: 'partial' }])])]);
   assert.ok(error instanceof UpstreamError, 'the request fails');

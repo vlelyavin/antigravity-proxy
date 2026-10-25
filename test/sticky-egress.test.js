@@ -13,18 +13,41 @@ test('the pool stays on the first account while it is healthy', () => {
   for (let i = 0; i < 5; i++) assert.equal(pool.pick([A, B]).id, A.id);
 });
 
-test('the second account takes over only while the first cools down', () => {
-  const pool = new AccountPool({ logger });
-  pool.cooldown(A.id, 60_000);
+test('the second account takes over while the first is restricted, and the first gets one probe after expiry', () => {
+  let now = 1_000;
+  const pool = new AccountPool({ logger, now: () => now });
+  pool.restrict({
+    accountId: A.id, scope: 'account', until: now + 100,
+    reason: 'account_restricted', evidence: 'pool_gate',
+  });
   assert.equal(pool.pick([A, B]).id, B.id);
-  pool.coolUntil.set(A.id, Date.now() - 1);
-  assert.equal(pool.pick([A, B]).id, A.id);
+  now += 101;
+  const probe = pool.select([A, B]);
+  assert.equal(probe.account.id, A.id);
+  assert.equal(pool.pick([A, B]).id, B.id, 'one probe at a time');
+  pool.releaseProbe(probe);
 });
 
 test('a request never retries an account it already tried', () => {
   const pool = new AccountPool({ logger });
   assert.equal(pool.pick([A, B], new Set([A.id])).id, B.id);
   assert.equal(pool.pick([A, B], new Set([A.id, B.id])), null);
+});
+
+test('effective egress identity includes the authenticated session, and only its alias is exposable', () => {
+  const client = new UpstreamClient({
+    logger,
+    config: { upstream: { egress: { url: null, accounts: {
+      'a@x': 'socks5://alice:secret@127.0.0.1:1055',
+      'acc2.json': 'socks5://bob:other@127.0.0.1:1055',
+    } } } },
+  });
+  const first = client.egressIdentityFor(A);
+  const second = client.egressIdentityFor(B);
+  assert.equal(first.key.includes('alice'), true);
+  assert.notEqual(first.key, second.key, 'same host:port, different authenticated session');
+  assert.notEqual(first.alias, second.alias);
+  assert.doesNotMatch(first.alias, /alice|secret|127\.0\.0\.1/);
 });
 
 test('each account resolves its own egress: by email, else by credential file name, else the default', () => {

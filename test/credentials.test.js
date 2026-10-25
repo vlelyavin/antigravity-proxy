@@ -14,6 +14,7 @@ test('normalizes the agy token file shape', () => {
   assert.equal(account.accessToken, 'A');
   assert.equal(account.refreshToken, 'R');
   assert.ok(account.expiry > 0);
+  assert.match(account.generation, /^[0-9a-f]{64}$/, 'material generation is private and derived from the refresh token');
 });
 
 test('normalizes the gemini-cli token file shape with id_token email', () => {
@@ -42,12 +43,23 @@ test('config file overrides defaults', async () => {
   assert.equal(config.listen.port, 7000);
 });
 
-test('account pool sticks to the first account and moves on only after a cooldown', () => {
-  const pool = new AccountPool({ logger: console });
-  const accounts = [{ id: 'a' }, { id: 'b' }];
+test('account pool sticks to the first account until a scoped restriction applies', () => {
+  let now = 1_000;
+  const pool = new AccountPool({ logger: console, now: () => now });
+  const accounts = [{ id: 'a', generation: 'ga' }, { id: 'b', generation: 'gb' }];
   assert.equal(pool.pick(accounts).id, 'a');
   assert.equal(pool.pick(accounts).id, 'a');
-  pool.cooldown('a', 60_000);
+  pool.restrict({
+    accountId: 'a', scope: 'account', until: now + 60_000,
+    reason: 'account_restricted', evidence: 'pool_gate',
+  });
   assert.equal(pool.pick(accounts).id, 'b');
-  assert.equal(pool.pick(accounts).id, 'b');
+  // The restriction expires into a single real recovery probe, not into a flood of requesters.
+  now += 60_001;
+  const probe = pool.select(accounts);
+  assert.equal(probe.account.id, 'a');
+  assert.equal(probe.probes.length, 1);
+  assert.equal(pool.select(accounts).account.id, 'b', 'the probe is owned by the first request');
+  pool.releaseProbe(probe);
+  assert.equal(pool.select(accounts).account.id, 'a', 'release returns the scope to probe-eligible, not to healthy');
 });

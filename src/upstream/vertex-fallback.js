@@ -30,14 +30,25 @@ export async function generateViaVertexFallback({ openAiBody, vertexUrl, timeout
   });
   const text = await resp.text();
   if (!resp.ok) {
-    throw new UpstreamError(`vertex fallback upstream ${resp.status}: ${text.slice(0, 300)}`, { status: resp.status });
+    // Fixed text: the fallback body is provider payload and never becomes a caller message.
+    throw new UpstreamError('vertex fallback is unavailable', {
+      status: 502, origin: 'generation', phase: 'dispatch', reason: 'provider_unavailable',
+      scope: 'provider', evidence: 'http_5xx', observedStatus: Number.isInteger(resp.status) ? resp.status : null,
+      publicStatus: 502,
+    });
   }
   let json;
   try { json = JSON.parse(text); } catch {
-    throw new UpstreamError(`vertex fallback returned non-JSON (${text.length}b)`, { status: 502 });
+    throw new UpstreamError('vertex fallback returned a malformed body', {
+      status: 502, origin: 'protocol', phase: 'validation', reason: 'malformed',
+      scope: 'provider', evidence: 'json_body_parse', publicStatus: 502,
+    });
   }
   if (json?.error) {
-    throw new UpstreamError(`vertex fallback error: ${json.error.message || 'unknown'}`, { status: 502 });
+    throw new UpstreamError('vertex fallback returned an error', {
+      status: 502, origin: 'generation', phase: 'dispatch', reason: 'provider_unavailable',
+      scope: 'provider', evidence: 'embedded_error', publicStatus: 502,
+    });
   }
   return json;
 }

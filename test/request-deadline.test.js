@@ -107,7 +107,7 @@ test('the request deadline bounds a hanging pool and cools no account', async ()
     assert.ok(res.elapsedMs >= 350 && res.elapsedMs < 2000, `elapsed ${res.elapsedMs}ms`);
     assert.equal(stack.starts.length, 1, 'a spent budget starts no further account');
     assert.equal(stack.pool.healthy(ACCOUNTS).length, 2, 'a deadline is not an upstream failure');
-    assert.ok(!stack.events.some((e) => e.event === 'account.cooldown'));
+    assert.ok(!stack.events.some((e) => e.event === 'pool.restriction'));
     const attempt = stack.events.find((e) => e.event === 'attempt.timing');
     assert.equal(attempt.outcome, 'deadline');
     assert.equal(attempt.status, 504);
@@ -172,10 +172,16 @@ test('a spent deadline never starts the Vertex fallback', async () => {
 test('timings carry the request id and an anonymised account, never the email', async () => {
   const stack = await startStack({ rotation: { requestDeadlineMs: 300, attemptTimeoutsMs: [10_000] } });
   try {
-    const res = await chat(stack.port, { 'x-request-id': 'probe-request-1' });
+    const supplied = '9f1c2d3e-4a5b-4c6d-8e7f-102132435465';
+    const res = await chat(stack.port, { 'x-request-id': supplied });
     assert.equal(res.status, 504);
     const request = stack.events.find((e) => e.event === 'request.timing');
-    assert.equal(request.requestId, 'probe-request-1');
+    assert.equal(request.requestId, supplied, 'a strict UUID caller id is accepted as correlation');
+    const junk = await chat(stack.port, { 'x-request-id': 'probe-request-1' });
+    assert.equal(junk.status, 504);
+    const junkRequest = stack.events.filter((e) => e.event === 'request.timing').at(-1);
+    assert.match(junkRequest.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.notEqual(junkRequest.requestId, 'probe-request-1', 'arbitrary caller header text is never journaled');
     assert.equal(typeof request.status, 'number');
     assert.equal(typeof request.reason, 'string');
     const attempt = stack.events.find((e) => e.event === 'attempt.timing');

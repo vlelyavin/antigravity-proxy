@@ -198,53 +198,74 @@ test('mid-stream failure emits error frame + [DONE] (H4)', async () => {
   }
 });
 
-test('all-accounts-cooling fails fast with 429 (M9)', async () => {
+test('a proven scoped quota gate answers 429 with a real eligibility time', async () => {
   const stack = await startStack({
-    accounts: [{ id: 'q1', projectId: 'p' }],
+    accounts: [{ id: 'q1', generation: 'g1', projectId: 'p' }],
   });
-  stack.pool.cooldown('q1', 60_000);
+  stack.pool.restrict({
+    accountId: 'q1', scope: 'account', until: Date.now() + 60_000,
+    reason: 'account_restricted', evidence: 'pool_gate',
+  });
   try {
     const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 429);
+    assert.ok(Number(res.headers.get('retry-after')) > 0, 'the gate proves when the account becomes eligible again');
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }
 });
 
-test('429 rotates to the second account (kind=quota)', async () => {
+test('a blocked credential answers 503, never a fabricated 429', async () => {
   const stack = await startStack({
-    accounts: [
-      { id: 'q1', email: 'dead@x', projectId: 'p-exhausted' },
-      { id: 'q2', email: 'alive@x', projectId: 'p' },
-    ],
+    accounts: [{ id: 'q1', generation: 'g1', projectId: 'p' }],
+  });
+  stack.pool.blockGeneration({
+    accountId: 'q1', generation: 'g1', reason: 'revoked_credential', evidence: 'oauth_invalid_grant',
   });
   try {
-    // q1 is picked first and answers 429: the same request moves on to q2
     const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
-    assert.equal(res.status, 200);
-    const json = await res.json();
-    assert.equal(json.choices[0].message.content, 'hey');
-    // and q1 sits out its cooldown
-    assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('x-agy-reason'), 'credential_blocked');
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }
 });
 
-test('a transport 502 still cools that account and fails over to the next one', async () => {
-  const stack = await startStack({
-    accounts: [
-      { id: 't1', email: 'deadlane@x', projectId: 'p-502' },
-      { id: 't2', email: 'alive@x', projectId: 'p' },
-    ],
-  });
+test('an unscoped 429 rotates inside the request and cools nobody', async () => {
+  const accounts = [
+    { id: 'q1', generation: 'g1', email: 'dead@x', projectId: 'p-exhausted' },
+    { id: 'q2', generation: 'g2', email: 'alive@x', projectId: 'p' },
+  ];
+  const stack = await startStack({ accounts });
+  try {
+    // q1 is picked first and answers 429: the same request moves on to q2, but the unknown quota
+    // owner never becomes shared account state.
+    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.choices[0].message.content, 'hey');
+    assert.deepEqual(stack.pool.healthy(accounts).map((a) => a.id), ['q1', 'q2'], 'no shared cooldown');
+    assert.equal(stack.pool.select(accounts).account.id, 'q1', 'sticky-first is preserved for the next request');
+  } finally {
+    stack.server.close(); stack.upstreamServer.close();
+  }
+});
+
+test('a generic transport 502 fails over without cooling or fabricating a 429', async () => {
+  const accounts = [
+    { id: 't1', generation: 'g1', email: 'deadlane@x', projectId: 'p-502' },
+    { id: 't2', generation: 'g2', email: 'alive@x', projectId: 'p' },
+  ];
+  const stack = await startStack({ accounts });
   try {
     const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);
     const json = await res.json();
     assert.equal(json.choices[0].message.content, 'hey');
-    // the dead lane sits out the short transport cooldown; the account that answered keeps its place
-    assert.deepEqual(stack.pool.healthy([{ id: 't1' }, { id: 't2' }]).map((a) => a.id), ['t2']);
+    assert.deepEqual(stack.pool.healthy(accounts).map((a) => a.id), ['t1', 't2'], 'a 5xx proves no account penalty');
+    // a second request is not answered with an invented quota 429
+    const next = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(next.status, 200);
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }

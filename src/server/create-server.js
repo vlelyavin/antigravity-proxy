@@ -2,6 +2,8 @@ import http from 'node:http';
 import { checkApiKey, errorResponse, failureReason, handleWithRotation } from './handlers.js';
 import { modelsPayload } from '../rewrite/models.js';
 import { UpstreamError } from '../upstream/upstream-client.js';
+import { POLICY_VERSION, describeFailure, safeClientMessage } from '../upstream/failure.js';
+import { createCallContext } from './call-context.js';
 
 /**
  * Buffers the request body. `res` is written directly on the oversize path: the caller must see an
@@ -9,7 +11,7 @@ import { UpstreamError } from '../upstream/upstream-client.js';
  * be pointless. Rejections carry clientAborted/tooLarge so the handler answers only when there is
  * somebody left to answer.
  */
-export function readBody(req, res, limitBytes = 32 * 1024 * 1024) {
+export function readBody(req, res, limitBytes = 32 * 1024 * 1024, headers = {}) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -24,7 +26,12 @@ export function readBody(req, res, limitBytes = 32 * 1024 * 1024) {
       size += chunk.length;
       if (size > limitBytes) {
         const body = JSON.stringify({ error: { message: 'request body too large', type: 'invalid_request_error', code: 413 } });
-        res.writeHead(413, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), connection: 'close' });
+        res.writeHead(413, {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          connection: 'close',
+          ...headers,
+        });
         // flush the rejection before the socket goes, so the client reads 413 and not ECONNRESET
         res.end(body, () => req.destroy());
         const error = new Error('request body too large');
@@ -60,6 +67,19 @@ function attemptTimeouts(req, config) {
   const values = raw.split(',').map((v) => Number(v.trim()));
   if (values.some((v) => !Number.isInteger(v) || v <= 0)) return [];
   return values.map((v) => Math.min(v, config.upstream.requestTimeoutMs));
+}
+
+/**
+ * Retry-After is only exposed from an actual recorded eligibility time (a scoped gate or a parsed
+ * upstream header), never from a generic cooldown constant.
+ */
+function retryHeaders(headers, error, logger) {
+  const retryAt = error?.retryAt;
+  if (!Number.isFinite(retryAt)) return headers;
+  const seconds = Math.ceil((retryAt - Date.now()) / 1000);
+  if (seconds <= 0) return headers;
+  logger.info('retry_after.exposed', { seconds, reason: describeFailure(error).reason });
+  return { ...headers, 'retry-after': String(seconds) };
 }
 
 /**
@@ -104,12 +124,23 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
       if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
       let accounts = [];
       let error = null;
-      try { accounts = credentialStore.readAll(); } catch (e) { error = e.message; }
+      try { accounts = credentialStore.readAll(); } catch (e) { error = failureReason(e); }
+      // Liveness (can credentials be read) and eligibility (scoped shared state) are separate.
+      // Existing fields stay for compatibility; the new block carries aliases/enums only.
+      const eligibility = pool?.snapshot ? pool.snapshot(error ? null : accounts) : null;
       const body = JSON.stringify({
         status: error ? 'degraded' : 'ok',
+        liveness: error ? 'degraded' : 'ok',
         accounts: accounts.map((a) => ({ email: a.email, project: a.projectId ? 'set' : 'missing', tokenExpiresAt: a.expiry ? new Date(a.expiry).toISOString() : null })),
         upstream: config.upstream.baseUrl,
         error,
+        policyVersion: POLICY_VERSION,
+        eligibility: eligibility ? {
+          status: eligibility.restricted ? 'restricted' : 'ok',
+          restrictions: eligibility.restrictions,
+          credentialBlocks: eligibility.credentialBlocks,
+          activeProbes: eligibility.activeProbes,
+        } : null,
       });
       res.writeHead(error ? 503 : 200, { 'content-type': 'application/json' });
       res.end(body);
@@ -126,39 +157,48 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
 
     if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions')) {
       if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
+      const call = createCallContext(req, { model: null });
       let openAiBody;
       try {
-        openAiBody = JSON.parse(await readBody(req, res));
+        openAiBody = JSON.parse(await readBody(req, res, undefined, call.headers()));
       } catch (error) {
         // the 413 is already written; a caller that left mid-upload gets no answer
         if (error.tooLarge || error.clientAborted) return;
-        return errorResponse(res, 400, `invalid JSON body: ${error.message}`);
+        return errorResponse(res, 400, 'invalid JSON body', 'invalid_request_error', call.headers());
       }
       if (!Array.isArray(openAiBody.messages) || openAiBody.messages.length === 0) {
-        return errorResponse(res, 400, 'messages must be a non-empty array');
+        return errorResponse(res, 400, 'messages must be a non-empty array', 'invalid_request_error', call.headers());
       }
       if (!openAiBody.model) openAiBody.model = 'gemini-3.8-flash-high';
       openAiBody.stream = openAiBody.stream === true;
+      call.setModel(openAiBody.model);
 
       // abort upstream generation when the client goes away (quota protection)
       const client = watchClientGone(res);
       try {
         await handleWithRotation({
           pool, store: credentialStore, upstream, config, logger, openAiBody, req, res,
-          signal: client.signal, attemptTimeoutsMs: attemptTimeouts(req, config),
+          signal: client.signal, attemptTimeoutsMs: attemptTimeouts(req, config), call,
         });
       } catch (error) {
         if (client.signal.aborted) {
-          logger.warn('chat.client_aborted', { model: openAiBody.model });
+          logger.warn('chat.client_aborted', { model: call.modelRequested, requestId: call.requestId });
           return;
         }
+        const failure = describeFailure(error);
         const status = error instanceof UpstreamError
-          ? error.status
-          : (error.status === 400 ? 400 : 502);
-        const type = status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' : 'server_error';
-        logger.error('chat.failed', { status, reason: failureReason(error) });
-        if (!res.headersSent) errorResponse(res, status, error.message, type);
-        else res.end();
+          ? error.publicStatus
+          : (Number.isInteger(failure?.publicStatus) ? failure.publicStatus : (error.status === 400 ? 400 : 502));
+        const type = status === 429 ? 'rate_limit_error' : status === 400 ? 'invalid_request_error' : 'server_error';
+        logger.error('chat.failed', {
+          requestId: call.requestId, status, reason: failureReason(error),
+          observedStatus: failure.observedStatus, failureReason: failure.reason, scope: failure.scope,
+          policyVersion: POLICY_VERSION,
+        });
+        if (!res.headersSent) {
+          errorResponse(res, status, safeClientMessage(error, call.requestId), type,
+            retryHeaders(call.headers(), error, logger));
+        } else res.end();
       } finally {
         client.stop();
       }
@@ -169,35 +209,47 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
     const nativeMatch = /^(?:\/v1beta\/models\/|\/v1\/(?:beta\/)?models\/)([^/:]+):generateContent$/.exec(url.pathname);
     if (req.method === 'POST' && nativeMatch) {
       if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
+      const call = createCallContext(req, { model: null });
       let nativeBody;
       try {
-        nativeBody = JSON.parse(await readBody(req, res));
+        nativeBody = JSON.parse(await readBody(req, res, undefined, call.headers()));
       } catch (error) {
         if (error.tooLarge || error.clientAborted) return;
-        return errorResponse(res, 400, `invalid JSON body: ${error.message}`);
+        return errorResponse(res, 400, 'invalid JSON body', 'invalid_request_error', call.headers());
       }
-      const model = decodeURIComponent(nativeMatch[1]);
+      let model;
+      try { model = decodeURIComponent(nativeMatch[1]); } catch { model = nativeMatch[1]; }
+      call.setModel(model);
       const { geminiNativeToOpenAi } = await import('../rewrite/gemini-native.js');
       const openAiBody = geminiNativeToOpenAi(nativeBody, { model });
       if (openAiBody.messages.length === 0) {
-        return errorResponse(res, 400, 'contents must be a non-empty array');
+        return errorResponse(res, 400, 'contents must be a non-empty array', 'invalid_request_error', call.headers());
       }
       const client = watchClientGone(res);
       try {
         await handleWithRotation({
           pool, store: credentialStore, upstream, config, logger,
           openAiBody, req, res, signal: client.signal,
-          respondNative: true, attemptTimeoutsMs: attemptTimeouts(req, config),
+          respondNative: true, attemptTimeoutsMs: attemptTimeouts(req, config), call,
         });
       } catch (error) {
         if (client.signal.aborted) {
-          logger.warn('native.client_aborted', { model });
+          logger.warn('native.client_aborted', { model: call.modelRequested, requestId: call.requestId });
           return;
         }
-        const status = error instanceof UpstreamError ? error.status : (error.status === 400 ? 400 : 502);
-        logger.error('native.failed', { status, reason: failureReason(error) });
+        const failure = describeFailure(error);
+        const status = error instanceof UpstreamError
+          ? error.publicStatus
+          : (Number.isInteger(failure?.publicStatus) ? failure.publicStatus : (error.status === 400 ? 400 : 502));
+        logger.error('native.failed', {
+          requestId: call.requestId, status, reason: failureReason(error),
+          observedStatus: failure.observedStatus, failureReason: failure.reason, scope: failure.scope,
+          policyVersion: POLICY_VERSION,
+        });
         if (!res.headersSent) {
-          errorResponse(res, status, error.message, status === 429 ? 'rate_limit_error' : 'server_error');
+          errorResponse(res, status, safeClientMessage(error, call.requestId),
+            status === 429 ? 'rate_limit_error' : status === 400 ? 'invalid_request_error' : 'server_error',
+            retryHeaders(call.headers(), error, logger));
         } else res.end();
       } finally {
         client.stop();

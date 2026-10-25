@@ -1,19 +1,27 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { newSessionId } from '../credentials/oauth.js';
-import { openAiToAntigravity } from '../rewrite/openai-translate.js';
+import { materialGeneration } from '../credentials/credential-store.js';
+import { canonicalModel, openAiToAntigravity } from '../rewrite/openai-translate.js';
+import { errorCategory } from '../utils/error-category.js';
 import { dropIdleSockets, makeEgressAgent } from './egress.js';
 import { accountLabel } from '../utils/alias.js';
+import {
+  UpstreamError,
+  publicFailureText,
+  upstreamErrorFrom,
+  upstreamErrorFromJson,
+} from './failure.js';
 
-export class UpstreamError extends Error {
-  constructor(message, { status = 502, retryable = false, accountId = null, kind = 'other' } = {}) {
-    super(message);
-    this.name = 'UpstreamError';
-    this.status = status;
-    this.retryable = retryable;
-    this.accountId = accountId;
-    // rotation keys off this (quota -> cooldown + next account, auth -> invalidate + next account)
-    this.kind = kind;
-  }
+// The structured failure contract lives in failure.js; these re-exports keep the historical
+// import sites (`upstream-client.js`) working.
+export { UpstreamError, upstreamErrorFrom, upstreamErrorFromJson };
+
+/** Private material generation of an account: access-token refreshes keep it, re-login changes it. */
+export function generationOf(account) {
+  if (!account) return null;
+  if (typeof account.generation === 'string' && account.generation !== '') return account.generation;
+  return materialGeneration(account.refreshToken);
 }
 
 /** Rejects once the signal aborts; the underlying work (a shared token refresh) keeps running. */
@@ -38,48 +46,105 @@ export function abortFailure(signal) {
   return signal?.reason instanceof Error ? signal.reason : new Error('aborted');
 }
 
-/**
- * An explicit upstream error object (an SSE `{"error":…}` frame, or a JSON body) as the same
- * structured UpstreamError the HTTP status path produces, so rotation keys off it identically.
- */
-export function upstreamErrorFromJson(error, accountId = null) {
-  const status = Number.isInteger(error?.code) ? error.code : 502;
-  return upstreamErrorFrom(status, JSON.stringify({ error }), accountId);
+function oauthFailure(error, account, generation) {
+  const reason = ['revoked_credential', 'oauth_unavailable', 'oauth_malformed', 'oauth_rejected'].includes(error?.reason)
+    ? error.reason
+    : (error?.transient === true ? 'oauth_unavailable' : 'oauth_rejected');
+  const scope = reason === 'revoked_credential' ? 'credential' : 'unknown';
+  return new UpstreamError(publicFailureText(reason), {
+    origin: 'oauth',
+    phase: 'refresh',
+    reason,
+    scope,
+    evidence: error?.evidence ?? 'oauth_http_status',
+    observedStatus: error?.observedStatus ?? null,
+    publicStatus: 502,
+    retryable: error?.transient === true,
+    accountId: account.id,
+    generation,
+    cause: error,
+  });
 }
 
-export function upstreamErrorFrom(status, text, accountId) {
-  // structured kind (M10): rotation keys off this, never off message text
-  let kind = 'other';
-  let parsedStatus = null;
-  try {
-    parsedStatus = JSON.parse(text)?.error?.status ?? null;
-  } catch { /* not json */ }
-  if (status === 429 || parsedStatus === 'RESOURCE_EXHAUSTED') kind = 'quota';
-  else if (status === 401 || parsedStatus === 'UNAUTHENTICATED' || /invalid_grant/i.test(text)) kind = 'auth';
-  return new UpstreamError(`upstream ${status}: ${text.slice(0, 400)}`, {
-    status: status >= 500 ? 502 : status,
-    accountId,
-    kind,
+function egressFailure(error, meta) {
+  const reason = ['egress_invalid_config', 'egress_unavailable', 'egress_refused'].includes(error?.reason)
+    ? error.reason
+    : 'egress_unavailable';
+  return new UpstreamError(publicFailureText(reason), {
+    origin: 'egress',
+    phase: 'connect',
+    reason,
+    scope: 'egress',
+    evidence: error?.evidence ?? 'egress_dial',
+    publicStatus: 502,
+    retryable: true,
+    accountId: meta.accountId,
+    generation: meta.generation,
+    egressKey: meta.egressKey,
+    egressAlias: meta.egressAlias,
+    cause: error,
   });
+}
+
+function networkFailure(error, meta, phase = 'dispatch') {
+  const category = errorCategory(error);
+  return new UpstreamError('upstream network failure', {
+    origin: 'generation',
+    phase,
+    reason: 'unknown',
+    scope: 'unknown',
+    evidence: category === 'error' ? 'unclassified_error' : `error_${category}`,
+    publicStatus: 502,
+    retryable: true,
+    accountId: meta.accountId,
+    generation: meta.generation,
+    egressKey: meta.egressKey,
+    egressAlias: meta.egressAlias,
+    cause: error,
+  });
+}
+
+function timeoutFailure(meta) {
+  return new UpstreamError('upstream request timed out', {
+    origin: 'generation',
+    phase: 'dispatch',
+    reason: 'timeout',
+    scope: 'request',
+    evidence: 'local_abort',
+    publicStatus: 504,
+    retryable: true,
+    accountId: meta.accountId,
+    generation: meta.generation,
+    egressKey: meta.egressKey,
+    egressAlias: meta.egressAlias,
+  });
+}
+
+function isTimeoutCode(code) {
+  return code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'ERR_SOCKET_CONNECTION_TIMEOUT';
 }
 
 /**
  * Talks to the Cloud Code (antigravity) backend.
  * - one upstream client, account passed in per call
- * - access token refreshed in memory 5 min before expiry
- * - retryable: network errors and 5xx (NOT 429 — rotation handles that)
- * - egress: every account reaches Google through its own http(s) CONNECT proxy (node:https over the
- *   tunnel); the plain `fetch` branch only exists for a deployment with no egress configured
+ * - access token refreshed in memory 5 min before expiry, keyed by credential MATERIAL generation
+ * - the connection retry and the forced-auth retry share one two-POST allowance per credential
+ * - egress: every account reaches Google through its own http(s) CONNECT proxy; a proven egress
+ *   dial/CONNECT failure is attributed to that egress and never falls back to a direct connection
  */
 export class UpstreamClient {
   constructor({ config, logger }) {
     this.config = config;
     this.logger = logger;
-    // in-memory token cache: accountId -> { token, expiresAt }
+    // in-memory token cache: accountId -> { token, expiresAt, generation, version }
     this.tokens = new Map();
-    this.projects = new Map(); // accountId -> resolved project id
-    this.agents = new Map(); // egressUrl -> agent
-    this.refreshing = new Map(); // accountId -> in-flight refresh promise
+    // accountId -> { projectId, generation }
+    this.projects = new Map();
+    // egressUrl -> agent
+    this.agents = new Map();
+    // "<accountId>\0<generation>" -> in-flight refresh promise
+    this.refreshing = new Map();
+    this.tokenVersion = 0;
   }
 
   agentFor(egressUrl) {
@@ -102,6 +167,19 @@ export class UpstreamClient {
     return byEmail ?? byFile ?? egress.url ?? null;
   }
 
+  /**
+   * Effective egress identity. Two authenticated proxy sessions can share host:port, so the private
+   * key is the whole configured URL (including credentials). Only `alias` may be journaled.
+   */
+  egressIdentityFor(account) {
+    const url = this.egressFor(account);
+    if (!url) return { key: null, alias: 'direct' };
+    return {
+      key: url,
+      alias: `egress-${createHash('sha256').update(url).digest('hex').slice(0, 8)}`,
+    };
+  }
+
   /** fetch-shaped call through the account's egress (the oauth refresh must not leave from the host IP). */
   #fetchVia(egressUrl) {
     if (!egressUrl) return globalThis.fetch;
@@ -110,9 +188,8 @@ export class UpstreamClient {
   }
 
   /**
-   * The token refresh is shared by every caller of one account and is never cancelled by a caller
-   * that leaves, so its own network needs its own bound: without this a hung token endpoint pins
-   * the shared promise (and its dedup entry) forever.
+   * The token refresh is shared by every caller of one account/generation and is never cancelled by
+   * a caller that leaves, so its own network needs its own bound.
    */
   #boundedFetch(fetchImpl, timeoutMs) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || typeof AbortSignal?.timeout !== 'function') return fetchImpl;
@@ -228,53 +305,124 @@ export class UpstreamClient {
     });
   }
 
-  async accessToken(account, { fetchImpl = this.#fetchVia(this.egressFor(account)) } = {}) {
-    const cached = this.tokens.get(account.id);
-    const eager = this.config.upstream.eagerRefreshMs;
-    if (cached && cached.expiresAt - Date.now() > eager) {
-      return cached.token;
-    }
-    // in-flight dedup: N concurrent requests -> one refresh call
-    let pending = this.refreshing.get(account.id);
-    if (!pending) {
-      pending = (async () => {
-        const { refreshAccessToken } = await import('../credentials/oauth.js');
-        try {
-          const { accessToken, expiresIn } = await refreshAccessToken(account.refreshToken, {
-            fetchImpl: this.#boundedFetch(fetchImpl, this.config.upstream.requestTimeoutMs),
-          });
-          this.tokens.set(account.id, { token: accessToken, expiresAt: Date.now() + expiresIn * 1000 });
-          this.logger.info('oauth.refreshed', { account: accountLabel(account), expiresIn });
-          return accessToken;
-        } catch (error) {
-          // auth-dead refresh -> structured kind so rotation fires
-          throw new UpstreamError(`oauth refresh failed: ${error.message}`, { status: 401, kind: 'auth', accountId: account.id });
-        }
-      })().finally(() => this.refreshing.delete(account.id));
-      this.refreshing.set(account.id, pending);
-    }
-    return pending;
+  #refreshKey(account, generation) {
+    return `${account.id}\u0000${generation ?? 'unknown'}`;
   }
 
-  invalidate(accountId) {
-    this.tokens.delete(accountId);
-    this.projects.delete(accountId);
+  async accessToken(account, { fetchImpl = this.#fetchVia(this.egressFor(account)), budget = null } = {}) {
+    const generation = generationOf(account);
+    const cached = this.tokens.get(account.id);
+    const eager = this.config.upstream.eagerRefreshMs;
+    if (cached && cached.generation === generation && cached.expiresAt - Date.now() > eager) {
+      return cached.token;
+    }
+    const key = this.#refreshKey(account, generation);
+    // in-flight dedup: N concurrent requests -> one refresh call; a join is not a physical POST
+    let pending = this.refreshing.get(key);
+    if (pending) {
+      budget?.recordJoin();
+      return pending;
+    }
+    if (budget && !budget.takeOAuth(account.id)) {
+      throw new UpstreamError('oauth dispatch budget exhausted', {
+        origin: 'oauth', phase: 'refresh', reason: 'budget_exhausted', scope: 'request',
+        evidence: 'dispatch_budget', publicStatus: 503, accountId: account.id, generation,
+      });
+    }
+    const refreshStartedAt = Date.now();
+    const promise = (async () => {
+      const { refreshAccessToken } = await import('../credentials/oauth.js');
+      try {
+        const { accessToken, expiresIn } = await refreshAccessToken(account.refreshToken, {
+          fetchImpl: this.#boundedFetch(fetchImpl, this.config.upstream.requestTimeoutMs),
+        });
+        // A material replacement while the refresh was in flight must not cache the old token.
+        if (generationOf(account) !== generation) {
+          throw new UpstreamError('credential replaced during refresh', {
+            origin: 'oauth', phase: 'refresh', reason: 'credential_replaced', scope: 'credential',
+            evidence: 'credential_generation', publicStatus: 502, accountId: account.id, generation,
+          });
+        }
+        this.tokenVersion += 1;
+        const current = this.tokens.get(account.id);
+        // A late old-generation result must not replace a token written by newer material.
+        if (current && current.generation !== generation && current.cachedAt > refreshStartedAt) {
+          this.logger.info('oauth.stale_result_discarded', {
+            account: accountLabel(account), tokenVersion: this.tokenVersion,
+          });
+          return accessToken;
+        }
+        this.tokens.set(account.id, {
+          token: accessToken,
+          expiresAt: Date.now() + expiresIn * 1000,
+          generation,
+          version: this.tokenVersion,
+          cachedAt: Date.now(),
+        });
+        this.logger.info('oauth.refreshed', { account: accountLabel(account), expiresIn, tokenVersion: this.tokenVersion });
+        return accessToken;
+      } catch (error) {
+        if (error instanceof UpstreamError) throw error;
+        throw oauthFailure(error, account, generation);
+      }
+    })();
+    this.refreshing.set(key, promise);
+    // Cleanup is ownership-checked: a stale finally must not delete a newer generation's entry.
+    promise.then(
+      () => { if (this.refreshing.get(key) === promise) this.refreshing.delete(key); },
+      () => { if (this.refreshing.get(key) === promise) this.refreshing.delete(key); },
+    );
+    return promise;
+  }
+
+  /** Drops a cached access token so the next attempt refreshes; generation-checked. */
+  forceRefresh(account) {
+    const generation = generationOf(account);
+    const cached = this.tokens.get(account.id);
+    if (!cached) return false;
+    if (generation == null || cached.generation === generation) {
+      this.tokens.delete(account.id);
+      return true;
+    }
+    return false;
   }
 
   /**
-   * Project id for the account. Sources: credential file field, then a one-time
-   * loadCodeAssist probe (ideType ANTIGRAVITY) — same flow as the CLIProxyAPI
-   * antigravity auth (auth.go FetchProjectID). Cached in memory per account.
-   * The caller's signal is checked before the probe and handed to its request and body read: a
-   * cancelled call must not start a network round trip, not even after the shared token refresh it
-   * was waiting for finally finished.
+   * Generation-checked cache invalidation. Without a known material generation this is a no-op:
+   * deleting "whatever is cached" could erase a newer credential's token after a late old failure.
    */
-  async ensureProject(account, { fetchImpl, signal } = {}) {
+  invalidate(account, { generation = null } = {}) {
+    const id = typeof account === 'string' ? account : account?.id;
+    const expected = generation ?? (typeof account === 'object' ? generationOf(account) : null);
+    if (expected == null) return false;
+    let deleted = false;
+    const cached = this.tokens.get(id);
+    if (cached && cached.generation === expected) { this.tokens.delete(id); deleted = true; }
+    const project = this.projects.get(id);
+    if (project && project.generation === expected) { this.projects.delete(id); deleted = true; }
+    return deleted;
+  }
+
+  /**
+   * Project id for the account. Sources: credential file field, then a one-time loadCodeAssist
+   * probe (ideType ANTIGRAVITY). Cached per account AND material generation: a replaced credential
+   * never reuses the old project. The caller's signal is checked before the probe and handed to
+   * its request and body read.
+   */
+  async ensureProject(account, { signal, budget = null } = {}) {
+    const generation = generationOf(account);
     if (account.projectId) return account.projectId;
-    if (this.projects.has(account.id)) return this.projects.get(account.id);
+    const cached = this.projects.get(account.id);
+    if (cached && cached.generation === generation) return cached.projectId;
     if (signal?.aborted) throw abortFailure(signal);
-    const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl } : {}), signal);
+    const token = await abortable(this.accessToken(account, { budget }), signal);
     if (signal?.aborted) throw abortFailure(signal);
+    if (budget && !budget.takeProject(account.id)) {
+      throw new UpstreamError('project dispatch budget exhausted', {
+        origin: 'project', phase: 'project_resolution', reason: 'budget_exhausted', scope: 'request',
+        evidence: 'dispatch_budget', publicStatus: 503, accountId: account.id, generation,
+      });
+    }
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:loadCodeAssist`;
     const body = JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } });
     const headers = {
@@ -286,65 +434,82 @@ export class UpstreamClient {
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       if (signal?.aborted) throw abortFailure(signal);
-      throw new UpstreamError(`loadCodeAssist ${response.status}: ${text.slice(0, 200)}`, { status: response.status >= 500 ? 502 : response.status, retryable: false, accountId: account.id });
+      const error = upstreamErrorFrom(response.status, text, account.id, response.headers, { generation });
+      error.origin = 'project';
+      error.phase = 'project_resolution';
+      throw error;
     }
     let json;
     try {
       json = await response.json();
     } catch (error) {
       if (signal?.aborted) throw abortFailure(signal);
-      json = JSON.parse(await response.text());
+      throw new UpstreamError('loadCodeAssist response was malformed', {
+        origin: 'project', phase: 'project_resolution', reason: 'malformed', scope: 'request',
+        evidence: 'json_body_parse', publicStatus: 502, accountId: account.id, generation, cause: error,
+      });
     }
     if (signal?.aborted) throw abortFailure(signal);
     const project = json?.cloudaicompanionProject ?? json?.projectId ?? json?.project ?? null;
-    if (!project) {
-      throw new UpstreamError('loadCodeAssist: no cloudaicompanionProject in response', { status: 502, accountId: account.id });
+    if (!project || typeof project !== 'string') {
+      throw new UpstreamError('loadCodeAssist returned no project', {
+        origin: 'project', phase: 'project_resolution', reason: 'malformed', scope: 'request',
+        evidence: 'project_response', publicStatus: 502, accountId: account.id, generation,
+      });
     }
     account.projectId = project;
-    this.projects.set(account.id, project);
+    this.projects.set(account.id, { projectId: project, generation });
     // the project id itself stays out of the journal
     this.logger.info('project.resolved', { account: accountLabel(account) });
     return project;
   }
 
-  async buildBody(openAiBody, account, { signal } = {}) {
-    const projectId = await this.ensureProject(account, { signal });
+  async buildBody(openAiBody, account, { signal, projectId } = {}) {
+    const resolved = projectId ?? await this.ensureProject(account, { signal });
     if (signal?.aborted) throw abortFailure(signal);
-    const { canonicalModel } = await import('../rewrite/openai-translate.js');
-    return openAiToAntigravity({ ...openAiBody, model: canonicalModel(openAiBody.model) }, {
-      projectId,
-      sessionId: newSessionId(),
-    });
+    return openAiToAntigravity(
+      { ...openAiBody, model: canonicalModel(openAiBody.model) },
+      { projectId: resolved, sessionId: newSessionId() },
+    );
   }
 
-  /**
-   * Non-streaming generate. Returns parsed JSON of the antigravity response.
-   */
-  async generate({ openAiBody, account, fetchImpl, signal }) {
-    return this.#prepareAndFetch({ openAiBody, account, fetchImpl, signal, stream: false });
+  async generate({ openAiBody, account, fetchImpl, signal, budget = null, beforeDispatch = null, requestId = null }) {
+    return this.#prepareAndFetch({ openAiBody, account, fetchImpl, signal, stream: false, budget, beforeDispatch, requestId });
   }
 
-  /**
-   * Streaming generate. Returns the raw upstream Response (SSE body) — the caller
-   * pipes frames. Uses streamGenerateContent?alt=sse.
-   */
-  async generateStream({ openAiBody, account, fetchImpl, signal }) {
-    return this.#prepareAndFetch({ openAiBody, account, fetchImpl, signal, stream: true });
+  async generateStream({ openAiBody, account, fetchImpl, signal, budget = null, beforeDispatch = null, requestId = null }) {
+    return this.#prepareAndFetch({ openAiBody, account, fetchImpl, signal, stream: true, budget, beforeDispatch, requestId });
   }
 
   /** Token, project and body, each abortable: a caller that left starts no further step. */
-  async #prepareAndFetch({ openAiBody, account, fetchImpl, signal, stream }) {
+  async #prepareAndFetch({ openAiBody, account, fetchImpl, signal, stream, budget, beforeDispatch, requestId }) {
     if (signal?.aborted) throw abortFailure(signal);
-    const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl } : {}), signal);
+    const generation = generationOf(account);
+    const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl, budget } : { budget }), signal);
     if (signal?.aborted) throw abortFailure(signal);
-    const body = await abortable(this.buildBody(openAiBody, account, { signal }), signal);
+    const projectId = await abortable(this.ensureProject(account, { signal, budget }), signal);
     if (signal?.aborted) throw abortFailure(signal);
+    const body = await abortable(this.buildBody(openAiBody, account, { signal, projectId }), signal);
+    if (signal?.aborted) throw abortFailure(signal);
+    const egress = this.egressIdentityFor(account);
+    const meta = {
+      requestId,
+      accountId: account.id,
+      generation,
+      projectId,
+      outboundModel: body?.model ?? null,
+      requestedModel: openAiBody?.model ?? null,
+      egressKey: egress.key,
+      egressAlias: egress.alias,
+    };
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:`
       + (stream ? 'streamGenerateContent?alt=sse' : 'generateContent');
-    return this.#doFetch({ url, token, body, account, fetchImpl, signal, stream });
+    return this.#doFetch({
+      url, token, body, account, fetchImpl, signal, stream, budget, beforeDispatch, meta,
+    });
   }
 
-  async #doFetch({ url, token, body, account, fetchImpl, signal, stream }) {
+  async #doFetch({ url, token, body, account, fetchImpl, signal, stream, budget, beforeDispatch, meta }) {
     // a request cancelled before it started (client gone, deadline spent) never reaches the wire
     if (signal?.aborted) throw abortFailure(signal);
     // enforce requestTimeoutMs (C2), combined with any client signal
@@ -357,42 +522,74 @@ export class UpstreamClient {
       authorization: `Bearer ${token}`,
       'content-type': 'application/json',
       'user-agent': this.config.upstream.userAgent,
+      ...(meta?.requestId ? { 'x-request-id': meta.requestId } : {}),
       ...(stream ? { accept: 'text/event-stream' } : {}),
     };
     const payload = JSON.stringify(body);
     const egressUrl = this.egressFor(account);
 
-    // One retry, pre-flight failures only (H1): if any response bytes arrived,
-    // the request reached the backend and a blind re-POST could double-bill.
+    const classifyThrown = (error) => {
+      if (error instanceof UpstreamError) return error;
+      if (signal?.aborted) return abortFailure(signal);
+      if (error?.name === 'EgressError') return egressFailure(error, meta);
+      if (combined?.aborted) return timeoutFailure(meta);
+      if (error?.name === 'AbortError' || isTimeoutCode(error?.code)) return timeoutFailure(meta);
+      return networkFailure(error, meta);
+    };
+
+    const dispatch = async () => {
+      // Immediately before the wire: the caller may be gone, the credential may have been replaced,
+      // a resolved resource gate may now apply, or this recovery probe may have lost its lease.
+      if (signal?.aborted) throw abortFailure(signal);
+      if (beforeDispatch) await beforeDispatch(meta);
+      if (signal?.aborted) throw abortFailure(signal);
+      if (budget && !budget.takeGeneration(account.id)) {
+        throw new UpstreamError('generation dispatch budget exhausted', {
+          origin: 'generation', phase: 'dispatch', reason: 'budget_exhausted', scope: 'request',
+          evidence: 'dispatch_budget', publicStatus: 503, accountId: account.id, generation: meta.generation,
+        });
+      }
+      return this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
+    };
+
+    // Only a pre-flight transport failure is retried once. A response, an auth/protocol decision
+    // or a budget stop is never blind-re-POSTed.
+    const PREFLIGHT_RETRYABLE = new Set(['timeout', 'egress_unavailable', 'egress_refused', 'unknown']);
     let preflightFailure = null;
     try {
-      const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
+      const response = await dispatch();
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
-      throw upstreamErrorFrom(response.status, text, account.id);
+      throw upstreamErrorFrom(response.status, text, account.id, response.headers, { generation: meta.generation });
     } catch (error) {
-      if (error instanceof UpstreamError) throw error;
-      if (signal?.aborted) throw abortFailure(signal);
-      if (error.name === 'AbortError' || /aborted|timed? ?out/i.test(error.message)) {
-        // timeout or client abort: do not retry
-        throw new UpstreamError(`upstream timeout/abort: ${error.message}`, { status: 504, accountId: account.id, kind: 'other' });
+      if (error instanceof UpstreamError) {
+        if (!PREFLIGHT_RETRYABLE.has(error.reason)) throw error;
+        preflightFailure = error;
+      } else {
+        if (signal?.aborted) throw abortFailure(signal);
+        const classified = classifyThrown(error);
+        if (!(classified instanceof UpstreamError)) throw classified;
+        if (!PREFLIGHT_RETRYABLE.has(classified.reason)) throw classified;
+        preflightFailure = classified;
       }
-      preflightFailure = error;
     }
     // the caller may have hung up while the first attempt was failing: do not re-POST for nobody
     if (signal?.aborted) throw abortFailure(signal);
+    if (budget && !budget.canTakeGeneration(account.id)) throw preflightFailure;
     // single pre-flight retry, on a fresh connection: the failed attempt most likely took a dead
     // pooled socket, and the pool can hold more of them (23.09 03:43: the retry hit one too)
     for (const agent of this.agents.values()) dropIdleSockets(agent);
     try {
-      const response = await this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
+      const response = await dispatch();
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
-      throw upstreamErrorFrom(response.status, text, account.id);
+      throw upstreamErrorFrom(response.status, text, account.id, response.headers, { generation: meta.generation });
     } catch (error) {
       if (error instanceof UpstreamError) throw error;
       if (signal?.aborted) throw abortFailure(signal);
-      throw new UpstreamError(`network error: ${preflightFailure?.message ?? error.message}`, { status: 502, accountId: account.id, kind: 'other' });
+      const classified = classifyThrown(error);
+      if (classified instanceof UpstreamError) throw classified;
+      throw networkFailure(error, meta, 'connect');
     }
   }
 }

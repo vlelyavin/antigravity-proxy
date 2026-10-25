@@ -151,7 +151,7 @@ test('a pre-flight network failure retries after dropping pooled sockets', async
     if (calls === 1) throw new Error('socket hang up');
     return { ok: true, status: 200, json: async () => ({}), text: async () => '{}' };
   };
-  const response = await client.generate({ openAiBody: { model: 'gemini-3.8-flash-low' }, account: { id: 'a' } });
+  const response = await client.generate({ openAiBody: { model: 'gemini-3.8-flash-low' }, account: { id: 'a', projectId: 'p' } });
   assert.equal(response.status, 200);
   assert.deepEqual(order, ['request1', 'drop', 'request2']);
 });

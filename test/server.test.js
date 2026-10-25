@@ -115,8 +115,8 @@ test('429 rotates to the second account', async () => {
     assert.equal(res.status, 200);
     const json = await res.json();
     assert.equal(json.choices[0].message.content, 'hey');
-    // q1 is cooling down now; when every account 429s, the upstream 429 reaches the client
-    assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q2']);
+    // the bare 429 stays request-local: no shared account cooldown
+    assert.deepEqual(stack.pool.healthy([{ id: 'q1' }, { id: 'q2' }]).map((a) => a.id), ['q1', 'q2']);
     const exhausted = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'TRIGGER_429' }] });
     assert.equal(exhausted.status, 429);
   } finally {
@@ -145,6 +145,21 @@ test('/health reports accounts; /v1/models lists catalog', async () => {
     const healthJson = await health.json();
     assert.equal(health.status, 200);
     assert.equal(healthJson.accounts[0].email, 'e@x');
+    assert.equal(healthJson.liveness, 'ok');
+    assert.equal(healthJson.eligibility.status, 'ok');
+    assert.equal(healthJson.eligibility.restrictions.length, 0);
+    assert.equal(healthJson.policyVersion, 'agy-rotator-1');
+    // scoped state is operator-readable without exposing identity
+    stack.pool.restrict({
+      accountId: 'h1', scope: 'account_model', model: 'gemini-3.8-flash-high',
+      until: Date.now() + 60_000, reason: 'scoped_quota', evidence: 'pool_gate',
+    });
+    const restricted = await (await fetch(`http://127.0.0.1:${stack.port}/health`)).json();
+    assert.equal(restricted.liveness, 'ok', 'readable credentials remain live');
+    assert.equal(restricted.eligibility.status, 'restricted');
+    assert.equal(restricted.eligibility.restrictions[0].scope, 'account_model');
+    assert.equal(restricted.eligibility.restrictions[0].resource, 'gemini-3.8-flash-high');
+    assert.equal(JSON.stringify(restricted).includes('h1'), false);
     const models = await fetch(`http://127.0.0.1:${stack.port}/v1/models`);
     const modelsJson = await models.json();
     assert.ok(modelsJson.data.some((m) => m.id === 'gemini-3.8-flash-high'));

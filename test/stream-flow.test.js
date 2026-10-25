@@ -131,7 +131,7 @@ test('an attempt with no meaningful frame rotates at the first-frame wait, cooli
   const stack = await startStage({ mode: 'silent', rotation: { firstMeaningfulFrameTimeoutMs: 120, idleTimeoutMs: 120 } });
   try {
     const res = await request(stack.port);
-    assert.equal(res.status, 504);
+    assert.equal(res.status, 504, res.text);
     assert.equal(stack.starts.length, 2, 'the second account gets the rest of the request');
     assert.ok(res.elapsedMs >= 200 && res.elapsedMs < 2000, `elapsed ${res.elapsedMs}ms`);
     const attempts = stack.events.filter((e) => e.event === 'attempt.timing');
@@ -142,7 +142,7 @@ test('an attempt with no meaningful frame rotates at the first-frame wait, cooli
     assert.equal(request1.status, 504);
     assert.equal(request1.attempts, 2);
     assert.equal(stack.pool.healthy(ACCOUNTS).length, 2, 'a stall is not an upstream quota/auth failure');
-    assert.ok(!stack.events.some((e) => e.event === 'account.cooldown'));
+    assert.ok(!stack.events.some((e) => e.event === 'pool.restriction'));
   } finally {
     stack.close();
   }

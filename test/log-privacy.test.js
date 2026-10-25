@@ -91,13 +91,14 @@ test('a transient upstream failure journals the category, not the body, the emai
     const res = await chat(stack.port);
     assert.equal(res.status, 502);
     const text = sink.text();
-    assert.match(text, /rotation\.transient/);
+    assert.match(text, /attempt\.timing .*outcome="transient"/);
+    assert.match(text, /attempt\.timing .*failureReason="endpoint_unavailable"/);
     assert.match(text, new RegExp(`account=${JSON.stringify(accountLabel(ACCOUNT))}`));
     assert.match(text, /status=502/);
     assertAbsent(text, ['SENTINEL_UPSTREAM_BODY', 'SENTINEL_PROMPT_TEXT', 'SENTINEL_PROJECT_ID',
       'sentinel@example.test', 'sentinel-token.json', '/home/sentinel', 'SENTINEL_ACCESS_TOKEN']);
     // the timing lines stay usable: a request id, an attempt number and the classification
-    assert.match(text, /attempt\.timing .*requestId="req-/);
+    assert.match(text, /attempt\.timing .*requestId="[0-9a-f-]{36}"/);
     assert.match(text, /attempt\.timing .*outcome="transient"/);
     assert.match(text, /request\.timing .*outcome="failed"/);
     assert.match(text, /request\.timing .*reason="other:502"/);
@@ -186,8 +187,8 @@ test('the refresh and project paths journal the alias, never the token, email or
   assert.match(text, /project\.resolved/);
   assertAbsent(text, ['SENTINEL_REFRESH_TOKEN', 'SENTINEL_ACCESS_TOKEN', 'SENTINEL_PROJECT_ID',
     'sentinel@example.test', 'token.json', '/home/sentinel']);
-  // the cache is untouched by the logging change
-  assert.equal(client.projects.get('/home/sentinel/token.json'), 'SENTINEL_PROJECT_ID');
+  // the generation-aware cache is untouched by the logging change
+  assert.equal(client.projects.get('/home/sentinel/token.json').projectId, 'SENTINEL_PROJECT_ID');
 });
 
 test('a credential file problem journals its alias and a category, not the file or its content', async () => {

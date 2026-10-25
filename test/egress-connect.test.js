@@ -236,7 +236,7 @@ test('cancellation through the rotation retries nothing and cools nobody', async
     assert.ok((await pending) instanceof Error);
     assert.equal(stack.lane.state.requests, 1, 'a cancelled caller never starts another account');
     assert.equal(pool.healthy(ACCOUNTS).length, 2, 'a caller that left is not an upstream failure');
-    assert.ok(!stack.events.some((e) => e.event === 'account.cooldown'));
+    assert.ok(!stack.events.some((e) => e.event === 'pool.restriction'));
     const attempt = stack.events.find((e) => e.event === 'attempt.timing');
     assert.equal(attempt.outcome, 'client_abort');
     assert.equal(attempt.account, accountLabel(ACCOUNT));

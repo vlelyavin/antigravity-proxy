@@ -1,4 +1,5 @@
 import { errorCategory } from '../utils/error-category.js';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,17 @@ export class CredentialStoreError extends Error {
     super(message, options);
     this.name = 'CredentialStoreError';
   }
+}
+
+/**
+ * Private material identity of one credential: the refresh token is the durable secret, while the
+ * access token rotates on every normal refresh. The value is never logged or exposed; it only keys
+ * in-memory caches and revoked-generation blocks. Replacing the refresh token at the same path
+ * produces a different generation, which is what makes the new credential selectable again.
+ */
+export function materialGeneration(refreshToken) {
+  if (typeof refreshToken !== 'string' || refreshToken === '') return null;
+  return createHash('sha256').update(refreshToken).digest('hex');
 }
 
 function expandHome(p, home = os.homedir()) {
@@ -122,6 +134,7 @@ export function normalizeAccount(raw, file) {
     projectId,
     accessToken,
     refreshToken,
+    generation: materialGeneration(refreshToken), // private; never journaled
     expiry, // epoch ms or null
   };
 }

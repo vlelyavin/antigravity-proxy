@@ -60,8 +60,10 @@ function fakeSocks5({ authMode = 'none' } = {}) {
 test('parseProxyUrl accepts supported schemes and rejects bad ones', () => {
   assert.equal(parseProxyUrl('socks5://u:p@1.2.3.4:1080').protocol, 'socks5:');
   assert.equal(parseProxyUrl('http://1.2.3.4:8080').protocol, 'http:');
-  assert.throws(() => parseProxyUrl('ftp://x:1'), EgressError);
-  assert.throws(() => parseProxyUrl('socks5://noport'), EgressError);
+  assert.throws(() => parseProxyUrl('ftp://x:1'), (error) => error instanceof EgressError
+    && error.stage === 'config' && error.reason === 'egress_invalid_config' && error.evidence === 'egress_config');
+  assert.throws(() => parseProxyUrl('socks5://noport'), (error) => error instanceof EgressError
+    && error.stage === 'config' && error.reason === 'egress_invalid_config');
 });
 
 test('socks5 handshake: greeting, connect, tunnel data', async () => {
@@ -96,10 +98,13 @@ test('socks5 auth mode: sends user/pass and completes', async () => {
   }
 });
 
-test('socks5 dead proxy fails closed with connect error', async () => {
+test('socks5 dead proxy fails closed with a structured egress failure', async () => {
   await assert.rejects(
     () => egressConnect({ egressUrl: 'socks5://127.0.0.1:1', host: 'example.org', port: 443, timeoutMs: 2000 }),
-    (error) => error instanceof EgressError && /ECONNREFUSED|timeout/.test(error.message),
+    (error) => error instanceof EgressError
+      && error.reason === 'egress_unavailable'
+      && error.stage === 'dial'
+      && !/127\.0\.0\.1/.test(error.message),
   );
 });
 

@@ -49,7 +49,9 @@ export const DEFAULTS = {
   },
 
   rotation: {
-    // after a 429 RESOURCE_EXHAUSTED the account cools down for this long (ms)
+    // Duration of a PROVEN scoped restriction (account/account+model/project). A bare 429 never
+    // uses it: its quota owner is unknown and it rotates only inside the request. The first adapter
+    // leaves the broad quota branch inactive because no genuine scoped AGY metadata was established.
     cooldownMs: 60_000,
     // Total budget for one request, preparation through the last fallback (ms). Mari cuts a turn
     // at 120 s, so the default sits just under it; raise it for callers that wait longer. The

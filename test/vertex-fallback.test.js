@@ -111,6 +111,9 @@ test('pool exhausted -> vertex fallback answers, request normalized + response_f
     assert.equal(res.status, 200);
     const json = await res.json();
     assert.equal(json.choices[0].message.content, 'vertex-ok');
+    assert.equal(res.headers.get('x-agy-route'), 'vertex_fallback');
+    assert.equal(res.headers.get('x-agy-attempts'), '1');
+    assert.equal(res.headers.get('x-agy-policy'), 'agy-rotator-1');
     assert.equal(stack.vertex.calls.length, 1);
     const sent = stack.vertex.calls[0].body;
     assert.equal(sent.model, 'gemini-3.8-flash'); // effort suffix stripped
@@ -139,7 +142,7 @@ test('fallback disabled -> upstream 429 propagates', async () => {
     const res = await post(stack.port, GEMINI_429);
     assert.equal(res.status, 429);
     assert.equal(stack.vertex.calls.length, 0);
-    assert.equal(stack.pool.healthy(ONE_ACCOUNT).length, 0, 'a genuine 429 still cools its account');
+    assert.equal(stack.pool.healthy(ONE_ACCOUNT).length, 1, 'an unscoped 429 does not write shared account state');
   } finally {
     stack.server.close(); stack.upstreamServer.close(); stack.vertex.server.close();
   }
@@ -185,7 +188,10 @@ test('stream request -> fallback answers as valid SSE (single chunk + DONE)', as
 
 test('all accounts cooling down -> fallback used', async () => {
   const stack = await startStack({ accounts: ONE_ACCOUNT });
-  stack.pool.cooldown('a1', 60_000);
+  stack.pool.restrict({
+    accountId: 'a1', scope: 'account', until: Date.now() + 60_000,
+    reason: 'account_restricted', evidence: 'pool_gate',
+  });
   try {
     const res = await post(stack.port, { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(res.status, 200);

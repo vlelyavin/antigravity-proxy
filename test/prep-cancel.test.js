@@ -113,7 +113,10 @@ test('a hung token endpoint is bounded by the transport timeout and does not pin
   const startedAt = Date.now();
   await assert.rejects(
     client.accessToken({ id: 'hung-refresh', refreshToken: 'r' }, { fetchImpl }),
-    (error) => error instanceof UpstreamError && error.kind === 'auth' && error.status === 401,
+    (error) => error instanceof UpstreamError
+      && error.reason === 'oauth_unavailable'
+      && error.publicStatus === 502
+      && error.kind !== 'auth',
   );
   const elapsedMs = Date.now() - startedAt;
   assert.ok(elapsedMs < 1000, `the refresh must be bounded by requestTimeoutMs: ${elapsedMs}ms`);

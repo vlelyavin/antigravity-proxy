@@ -139,8 +139,11 @@ test('an explicit upstream error frame rotates the next account in, bare or in t
       ],
     });
     assert.equal(raw.choices[0].message.content, 'second account');
-    assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a1'], 'the erroring account sits out its cooldown');
-    assert.ok(events.some((e) => e.event === 'rotation.quota'), 'the status still classifies it as quota');
+    assert.deepEqual(pool.healthy(ACCOUNTS).map((a) => a.id), ['a0', 'a1'], 'an unscoped 429 writes no shared state');
+    const attempt = events.find((e) => e.event === 'attempt.timing');
+    assert.equal(attempt.outcome, 'rate_limited');
+    assert.equal(attempt.failureScope, 'request');
+    assert.ok(!events.some((e) => e.event === 'pool.restriction'));
   }
 });
 
@@ -167,7 +170,9 @@ test('an error body on the streaming endpoint is not an empty completion, bare o
         pool: new AccountPool({ logger }), store: { readAll: () => [ACCOUNTS[0]] }, upstream,
         config: CONFIG_NO_FALLBACK, logger, openAiBody: BODY, res, signal: null,
       }),
-      (caught) => caught instanceof UpstreamError && caught.status === 502 && /UNAVAILABLE|backend busy/.test(caught.message),
+      (caught) => caught instanceof UpstreamError && caught.publicStatus === 502
+        && caught.reason === 'endpoint_unavailable'
+        && !/UNAVAILABLE|backend busy/.test(caught.message),
     );
   }
 });

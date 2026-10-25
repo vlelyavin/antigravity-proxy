@@ -8,10 +8,28 @@ import https from 'node:https';
 import http from 'node:http';
 import { URL } from 'node:url';
 
+/**
+ * A proven egress failure, stamped at its source.
+ *
+ * `stage` says where it happened (config parse, dial, handshake, CONNECT), `reason` separates
+ * invalid local configuration from network readiness, and `observedCode` is a fixed code (for
+ * example `connect_407`) rather than provider text. `egressKey`/`egressAlias` are attached by the
+ * caller that knows which exit was used; the key may contain proxy credentials and never reaches
+ * a journal.
+ */
 export class EgressError extends Error {
-  constructor(message, options = {}) {
-    super(message, options);
+  constructor(message, { stage = 'dial', reason = 'egress_unavailable', observedCode = null, cause, egressKey = null, egressAlias = null } = {}) {
+    super(message, cause ? { cause } : undefined);
     this.name = 'EgressError';
+    this.stage = stage;
+    this.reason = reason;
+    this.observedCode = observedCode;
+    this.evidence = stage === 'config' ? 'egress_config'
+      : stage === 'handshake' ? 'egress_handshake'
+        : stage === 'connect' ? 'egress_connect'
+          : 'egress_dial';
+    this.egressKey = egressKey;
+    this.egressAlias = egressAlias;
   }
 }
 
@@ -20,19 +38,23 @@ export function parseProxyUrl(raw) {
   try {
     url = new URL(raw);
   } catch {
-    throw new EgressError('invalid egress url: not a url');
+    throw new EgressError('invalid egress url: not a url', { stage: 'config', reason: 'egress_invalid_config', observedCode: 'url_parse' });
   }
   const scheme = url.protocol.replace(':', '');
   if (!['socks5', 'socks5h', 'http', 'https'].includes(scheme)) {
-    throw new EgressError(`invalid egress url: unsupported scheme ${scheme}`);
+    throw new EgressError('invalid egress url: unsupported scheme', { stage: 'config', reason: 'egress_invalid_config', observedCode: 'unsupported_scheme' });
   }
-  if (!url.hostname || !url.port) throw new EgressError('invalid egress url: missing host/port');
+  if (!url.hostname || !url.port) {
+    throw new EgressError('invalid egress url: missing host/port', { stage: 'config', reason: 'egress_invalid_config', observedCode: 'missing_host_port' });
+  }
   return url;
 }
 
-function withTimeout(promise, ms, message) {
+function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new EgressError(message)), ms);
+    const timer = setTimeout(() => reject(new EgressError('socks5: dial timeout', {
+      stage: 'dial', reason: 'egress_unavailable', observedCode: 'dial_timeout',
+    })), ms);
     promise.then(
       (value) => { clearTimeout(timer); resolve(value); },
       (error) => { clearTimeout(timer); reject(error); },
@@ -51,12 +73,16 @@ export function socks5Dial(proxyUrl, { host, port }, timeoutMs) {
     let stage = 'greeting'; // greeting -> auth -> connect -> done
     let settled = false;
 
-    const fail = (message) => {
+    const fail = (message, details = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      reject(new EgressError(`socks5: ${message}`));
+      reject(new EgressError(`socks5: ${message}`, {
+        stage: stage === 'connect' ? 'connect' : 'handshake',
+        reason: 'egress_unavailable',
+        ...details,
+      }));
     };
     const done = () => {
       if (settled) return;
@@ -70,12 +96,12 @@ export function socks5Dial(proxyUrl, { host, port }, timeoutMs) {
       resolve(socket);
     };
 
-    const timer = setTimeout(() => fail('handshake timeout'), timeoutMs);
-    socket.once('error', (err) => fail(err.message));
+    const timer = setTimeout(() => fail('handshake timeout', { stage: 'handshake', observedCode: 'handshake_timeout' }), timeoutMs);
+    socket.once('error', (err) => fail('proxy dial failed', { stage: 'dial', observedCode: 'dial_error', cause: err }));
     socket.on('data', (chunk) => {
       if (settled) return;
       buffer = Buffer.concat([buffer, chunk]);
-      try { pump(); } catch (error) { fail(error.message); }
+      try { pump(); } catch (error) { fail('protocol error', { observedCode: 'socks5_protocol', cause: error }); }
     });
 
     const sendGreeting = () => {
@@ -101,7 +127,7 @@ export function socks5Dial(proxyUrl, { host, port }, timeoutMs) {
       if (stage === 'greeting') {
         if (buffer.length < 2) return;
         const [version, method] = [buffer[0], buffer[1]];
-        if (version !== 0x05) return fail(`bad version ${version}`);
+        if (version !== 0x05) return fail('bad version', { observedCode: 'socks5_version' });
         buffer = buffer.subarray(2);
         if (method === 0x02 && username) {
           stage = 'auth';
@@ -110,12 +136,16 @@ export function socks5Dial(proxyUrl, { host, port }, timeoutMs) {
           stage = 'connect';
           sendConnect();
         } else {
-          return fail(`no acceptable auth method (0x${method.toString(16)})`);
+          return fail('no acceptable auth method', {
+            reason: 'egress_invalid_config', observedCode: 'socks5_auth_method',
+          });
         }
       }
       if (stage === 'auth') {
         if (buffer.length < 2) return;
-        if (buffer[1] !== 0x00) return fail('auth rejected');
+        if (buffer[1] !== 0x00) {
+          return fail('auth rejected', { reason: 'egress_invalid_config', observedCode: 'socks5_auth' });
+        }
         buffer = buffer.subarray(2);
         stage = 'connect';
         sendConnect();
@@ -123,8 +153,12 @@ export function socks5Dial(proxyUrl, { host, port }, timeoutMs) {
       if (stage === 'connect') {
         if (buffer.length < 6) return; // smallest reply: ver,rep,rsv,atyp(1=ipv4),4B addr,2B port
         if (buffer[1] !== 0x00) {
-          const codes = { 1: 'general failure', 2: 'not allowed', 3: 'network unreachable', 4: 'host unreachable', 5: 'connection refused', 6: 'ttl expired', 7: 'command not supported', 8: 'address type not supported' };
-          return fail(codes[buffer[1]] ?? `reply 0x${buffer[1].toString(16)}`);
+          const code = buffer[1];
+          return fail('connect rejected', {
+            stage: 'connect',
+            reason: code === 5 ? 'egress_refused' : 'egress_unavailable',
+            observedCode: `socks5_reply_${code}`,
+          });
         }
         const atyp = buffer[3];
         let need;
@@ -133,7 +167,7 @@ export function socks5Dial(proxyUrl, { host, port }, timeoutMs) {
         else if (atyp === 0x03) {
           if (buffer.length < 5) return;
           need = 5 + buffer[4] + 2;
-        } else return fail(`bad address type 0x${atyp.toString(16)}`);
+        } else return fail('bad address type', { observedCode: 'socks5_address_type' });
         if (buffer.length < need) return;
         buffer = buffer.subarray(need);
         stage = 'done';
@@ -155,7 +189,9 @@ function httpConnect(proxyUrl, { host, port }, timeoutMs) {
     // M8: destroy the half-open socket when the whole dance times out
     const timer = setTimeout(() => {
       if (socket) socket.destroy();
-      reject(new EgressError('http proxy: CONNECT timeout'));
+      reject(new EgressError('http proxy: CONNECT timeout', {
+        stage: 'connect', reason: 'egress_unavailable', observedCode: 'connect_timeout',
+      }));
     }, timeoutMs);
     const settle = (fn, value) => {
       clearTimeout(timer);
@@ -178,17 +214,25 @@ function httpConnect(proxyUrl, { host, port }, timeoutMs) {
         const code = Number(statusLine.split(' ')[1]);
         if (code !== 200) {
           sock.destroy();
-          return settle(reject, new EgressError(`http proxy: CONNECT ${code}`));
+          return settle(reject, new EgressError('http proxy: CONNECT rejected', {
+            stage: 'connect',
+            reason: code === 407 ? 'egress_invalid_config' : 'egress_refused',
+            observedCode: `connect_${Number.isInteger(code) ? code : 'invalid'}`,
+          }));
         }
         const rest = head.subarray(marker + 4);
         if (rest.length > 0) sock.unshift(rest);
         settle(resolve, sock);
       };
-      const onError = (err) => settle(reject, new EgressError(`http proxy: ${err.message}`));
+      const onError = (err) => settle(reject, new EgressError('http proxy: tunnel failed', {
+        stage: 'connect', reason: 'egress_unavailable', observedCode: 'tunnel_error', cause: err,
+      }));
       sock.on('data', onData);
       sock.once('error', onError);
     };
-    const onError = (err) => settle(reject, new EgressError(`http proxy: ${err.message}`));
+    const onError = (err) => settle(reject, new EgressError('http proxy: dial failed', {
+      stage: 'dial', reason: 'egress_unavailable', observedCode: 'dial_error', cause: err,
+    }));
     const opts = { host: proxyUrl.hostname, port: proxyPort };
     socket = scheme === 'https'
       ? tls.connect({ ...opts, servername: proxyUrl.hostname }, () => establish(socket))
@@ -206,7 +250,7 @@ export async function egressConnect({ egressUrl, host, port, timeoutMs = 30_000 
   const proxyUrl = parseProxyUrl(egressUrl);
   const scheme = proxyUrl.protocol.replace(':', '');
   if (scheme === 'socks5' || scheme === 'socks5h') {
-    return withTimeout(socks5Dial(proxyUrl, { host, port }, timeoutMs), timeoutMs + 1_000, 'socks5: dial timeout');
+    return withTimeout(socks5Dial(proxyUrl, { host, port }, timeoutMs), timeoutMs + 1_000);
   }
   return httpConnect(proxyUrl, { host, port }, timeoutMs);
 }
