@@ -97,7 +97,11 @@ test('the project id is cached: one probe, then the in-memory value', { timeout:
   assert.equal(probes, 1);
 });
 
-test('a hung token endpoint is bounded by the transport timeout and does not pin the dedup entry', { timeout: 2000 }, async () => {
+test('a hung token endpoint is bounded by the transport timeout and does not pin the dedup entry', { timeout: 2000 }, async (t) => {
+  // AbortSignal.timeout is unref'ed. This socket-free mock must own an event-loop reference,
+  // like the real pending network request, until the transport timeout or test deadline settles.
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
   const { logger } = recorder();
   const config = { ...CONFIG, upstream: { ...CONFIG.upstream, requestTimeoutMs: 60, eagerRefreshMs: 0, egress: { url: null } } };
   const client = new UpstreamClient({ config, logger });
