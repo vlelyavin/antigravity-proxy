@@ -45,6 +45,20 @@ function fakeVertex() {
   return { server, calls };
 }
 
+test('an already cancelled request starts no credential or body preparation', async () => {
+  const client = new UpstreamClient({ config: CONFIG, logger: createLogger('error') });
+  let preparationCalls = 0;
+  client.accessToken = async () => { preparationCalls++; return 'synthetic-token'; };
+  client.buildBody = async () => { preparationCalls++; return {}; };
+  const leaving = new AbortController();
+  const reason = new Error('client disconnected');
+  leaving.abort(reason);
+  for (const method of ['generate', 'generateStream']) {
+    await assert.rejects(client[method]({ openAiBody: {}, account: {}, signal: leaving.signal }), (error) => error === reason);
+  }
+  assert.equal(preparationCalls, 0);
+});
+
 test('a caller that hangs up while the answer is pending cancels the upstream and cools no account', async () => {
   const { logger, events } = recorder();
   const accounts = [

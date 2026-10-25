@@ -250,6 +250,7 @@ export class UpstreamClient {
    * Non-streaming generate. Returns parsed JSON of the antigravity response.
    */
   async generate({ openAiBody, account, fetchImpl, signal }) {
+    if (signal?.aborted) throw abortFailure(signal);
     const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl } : {}), signal);
     const body = await abortable(this.buildBody(openAiBody, account), signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:generateContent`;
@@ -261,6 +262,7 @@ export class UpstreamClient {
    * pipes frames. Uses streamGenerateContent?alt=sse.
    */
   async generateStream({ openAiBody, account, fetchImpl, signal }) {
+    if (signal?.aborted) throw abortFailure(signal);
     const token = await abortable(this.accessToken(account, fetchImpl ? { fetchImpl } : {}), signal);
     const body = await abortable(this.buildBody(openAiBody, account), signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:streamGenerateContent?alt=sse`;
