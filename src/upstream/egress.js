@@ -212,9 +212,12 @@ export async function egressConnect({ egressUrl, host, port, timeoutMs = 30_000 
 }
 
 /** tls.connect over the egress path; used as https.Agent createConnection. */
-export async function egressTlsConnection({ egressUrl, host, port = 443, servername, timeoutMs = 30_000 }) {
+export async function egressTlsConnection({ egressUrl, host, port = 443, servername, timeoutMs = 30_000, tlsOptions = null }) {
   const raw = await egressConnect({ egressUrl, host, port, timeoutMs });
   return tls.connect({
+    // extra trust material (for example a private CA) comes from the caller; verification itself
+    // is never disabled here
+    ...(tlsOptions ?? {}),
     socket: raw,
     servername: servername ?? host,
     // native antigravity sends no ALPN extension: keep the wire shape aligned
@@ -229,8 +232,12 @@ export async function egressTlsConnection({ egressUrl, host, port = 443, servern
 // alone. A fresh dial costs well under a second, a dead socket costs the whole request.
 export const IDLE_SOCKET_TIMEOUT_MS = 60_000;
 
-/** https.Agent (or http.Agent for plaintext) routing all connections through egress. */
-export function makeEgressAgent({ egressUrl, protocol = 'https:', idleSocketTimeoutMs = IDLE_SOCKET_TIMEOUT_MS }) {
+/**
+ * https.Agent (or http.Agent for plaintext) routing all connections through egress.
+ * tlsOptions carries extra trust material for the dial (a private CA); it never switches
+ * verification off.
+ */
+export function makeEgressAgent({ egressUrl, protocol = 'https:', idleSocketTimeoutMs = IDLE_SOCKET_TIMEOUT_MS, tlsOptions = null }) {
   const opts = { keepAlive: true, maxSockets: 8, timeout: idleSocketTimeoutMs };
   if (!egressUrl) {
     return protocol === 'https:' ? new https.Agent(opts) : new http.Agent(opts);
@@ -238,8 +245,11 @@ export function makeEgressAgent({ egressUrl, protocol = 'https:', idleSocketTime
   const connect = (options, cb) => {
     // node Agent may set only `hostname` — never dial "undefined"
     const host = options.hostname ?? options.host;
+    // The dial is bounded by the egress timeout (a CONNECT/TLS handshake that never completes is
+    // abandoned and its socket destroyed); the agent hands createConnection no abort hook, so a
+    // request cancelled while dialing is torn down when the dial finishes, not before.
     const dial = protocol === 'https:'
-      ? egressTlsConnection({ egressUrl, host, port: options.port ?? 443, servername: options.servername ?? host })
+      ? egressTlsConnection({ egressUrl, host, port: options.port ?? 443, servername: options.servername ?? host, tlsOptions })
       : egressConnect({ egressUrl, host, port: options.port ?? 80 });
     dial.then((socket) => cb(null, socket)).catch((err) => cb(err));
   };
