@@ -17,7 +17,7 @@ function recorder() {
   return { logger, events };
 }
 
-test('the project probe is cancelled with the caller that started it', async () => {
+test('the project probe is cancelled with the caller that started it', { timeout: 2000 }, async () => {
   const { logger } = recorder();
   const client = new UpstreamClient({ config: CONFIG, logger });
   client.accessToken = async () => 'synthetic-token';
@@ -44,7 +44,7 @@ test('the project probe is cancelled with the caller that started it', async () 
   assert.equal(probes.length, 1);
 });
 
-test('an already cancelled caller starts no project probe', async () => {
+test('an already cancelled caller starts no project probe', { timeout: 2000 }, async () => {
   const { logger } = recorder();
   const client = new UpstreamClient({ config: CONFIG, logger });
   let probes = 0;
@@ -57,7 +57,7 @@ test('an already cancelled caller starts no project probe', async () => {
   assert.equal(probes, 0);
 });
 
-test('a caller that leaves while the shared refresh runs starts no probe afterwards', async () => {
+test('a caller that leaves while the shared refresh runs starts no probe afterwards', { timeout: 2000 }, async () => {
   const { logger } = recorder();
   const client = new UpstreamClient({ config: CONFIG, logger });
   let probes = 0;
@@ -79,7 +79,7 @@ test('a caller that leaves while the shared refresh runs starts no probe afterwa
   assert.equal(probes, 0, 'the probe must not start for a caller that already left');
 });
 
-test('the project id is cached: one probe, then the in-memory value', async () => {
+test('the project id is cached: one probe, then the in-memory value', { timeout: 2000 }, async () => {
   const { logger } = recorder();
   const client = new UpstreamClient({ config: CONFIG, logger });
   client.accessToken = async () => 'synthetic-token';
@@ -97,7 +97,7 @@ test('the project id is cached: one probe, then the in-memory value', async () =
   assert.equal(probes, 1);
 });
 
-test('a hung token endpoint is bounded by the transport timeout and does not pin the dedup entry', async () => {
+test('a hung token endpoint is bounded by the transport timeout and does not pin the dedup entry', { timeout: 2000 }, async () => {
   const { logger } = recorder();
   const config = { ...CONFIG, upstream: { ...CONFIG.upstream, requestTimeoutMs: 60, eagerRefreshMs: 0, egress: { url: null } } };
   const client = new UpstreamClient({ config, logger });
