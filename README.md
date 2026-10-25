@@ -11,6 +11,7 @@ you have a google ai pro subscription. your tools want an openai endpoint. this 
 - streams: openai SSE out of the cloud-code SSE frames
 - multi-account round-robin with 429 cooldown — drop N token files in and it rotates
 - retries 5xx/network with backoff; quota errors rotate accounts instead of failing the request
+- bounds a held-open socket: the wait for the first meaningful frame and the gap between frames
 - optional api key so the port isn't a free-for-all on your lan
 - zero npm dependencies. node stdlib, nothing else.
 
@@ -92,7 +93,23 @@ every request has one total budget, `rotation.requestDeadlineMs` (default 110 s)
 
 a client that cannot wait out a hung upstream sends `x-attempt-timeouts-ms: 45000,30000` (non-stream only): the first account gets min(45 s, what is left of the budget), the next one min(30 s, the rest, the last value repeats), then the vertex fallback answers with the remainder. no header - no per-attempt cut, only the total budget. mari sends it; hermes and opencode don't.
 
-non-stream collection requires an explicit finish reason or prompt refusal, including when the streaming endpoint answers plain JSON. an incomplete response fails instead of becoming a fabricated `stop`.
+two flow timers cut an attempt that holds its socket open without progress: `rotation.firstMeaningfulFrameTimeoutMs` (default 45 s) waits for the first meaningful frame from the start of the attempt - preparation included - and `rotation.idleTimeoutMs` (default 30 s) bounds the gap between meaningful frames after that. a meaningful frame is text, thinking, a tool call, a refusal or an explicit terminal; keepalive frames and role-only deltas reset neither timer. neither timer extends the total budget or the ladder. the cut rotates to the next account only while nothing has been written to the caller: once the client stream has started, the same cut ends that stream with an error frame and no other account's output is mixed into it.
+
+terminal outcome: a generation ends successfully only with a documented finish reason (`STOP` -> `stop`, `MAX_TOKENS` -> `length`, the safety family -> `content_filter`) or a prompt-level refusal. `MALFORMED_FUNCTION_CALL`, `LANGUAGE`, `OTHER`, an unspecified or an unknown reason is a 502 protocol failure, never a fabricated `stop`; so is a stream that ends without a terminal frame - for a client stream that means an error frame plus `[DONE]`, and the request is journaled as failed. tool signatures and refusals cross unchanged.
+
+the native `generateContent` lane stays buffered: it has no frames to measure, so it keeps only the ladder and the total budget and the flow timers deliberately do not apply to it.
+
+## journal
+
+every line is payload-free by contract: no prompt or completion text, no upstream body, no refusal text, no token, no email, no credential path, no project id, no proxy credentials. accounts appear as a stable alias - `acct-` plus eight hex characters of the sha256 of their credential path - so lines still correlate across restarts; a refusal is a boolean (`blocked=true`), failures are a category (`reason="quota:429"`, `"client_disconnected"`, `"first_frame_timeout"`).
+
+- `attempt.timing requestId= attempt= account= stream= outcome= status= reason= prepMs= firstFrameMs= totalMs=` - one per account attempt. `firstFrameMs` is the wait for the first *meaningful* frame, so keepalive-only attempts report `null`.
+- `request.timing requestId= outcome= status= attempts= reason= totalMs= deadlineMs=` - one per request; `outcome` is `ok`, `failed`, `deadline`, `client_abort` or `vertex_fallback`.
+- `rotation.stall kind= first_frame_timeout|idle_timeout timeoutMs= rotatable=` - a flow cut, and whether another account could still answer.
+- `stream.failed reason=` for a client stream that ended badly (the error frame already went out).
+- `credentials.loaded accounts=[acct-...] projects=[set|missing] egress=[scheme//host:port]` - no emails, no token paths.
+
+`requestId` is the caller's `x-request-id` when it is short and printable, else `req-` plus twelve hex characters. the `/health` endpoint still lists account emails: it is an operator tool, not the journal.
 
 ## systemd
 
@@ -111,7 +128,7 @@ src/
   rewrite/        openai <-> cloud-code transforms + model catalog
   upstream/       cloud-code client with retry, account pool with cooldown
   server/         http surface: /health, /v1/models, /v1/chat/completions
-test/             34 tests, no network needed
+test/             node:test suite, no network needed (one local cert fixture)
 ```
 
 ## security
