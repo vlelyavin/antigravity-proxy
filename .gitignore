@@ -7,3 +7,6 @@ config.json
 .env.*
 *-token
 accounts/
+
+# local backups (may contain account lists)
+*.bak-*
