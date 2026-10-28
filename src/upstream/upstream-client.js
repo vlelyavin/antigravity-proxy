@@ -8,6 +8,7 @@ import { errorCategory } from '../utils/error-category.js';
 import { dropIdleSockets, makeEgressAgent } from './egress.js';
 import { accountLabel } from '../utils/alias.js';
 import {
+  POLICY_VERSION,
   UpstreamError,
   publicFailureText,
   upstreamErrorFrom,
@@ -148,6 +149,9 @@ export class UpstreamClient {
     this.refreshing = new Map();
     this.tokenVersion = 0;
     this.projectVersion = 0;
+    // accountId -> { alias, egressAlias, first }: accounts refused a lane another account holds
+    this.egressRefused = new Map();
+    this.egressReported = null; // last journaled egress configuration, so reloads stay quiet
   }
 
   #assertCurrent(account, phase) {
@@ -178,31 +182,135 @@ export class UpstreamClient {
   /**
    * The account's own exit: upstream.egress.accounts maps an account (email, else the credential
    * file name) to its egress url, so each account reaches Google from its own IP. Unmapped
-   * accounts use upstream.egress.url.
+   * accounts use upstream.egress.url, or nothing at all.
    */
   egressFor(account) {
-    const egress = this.config.upstream.egress ?? {};
-    const perAccount = egress.accounts ?? {};
+    return this.#perAccountExit(account) ?? this.config.upstream.egress?.url ?? null;
+  }
+
+  /** The exit declared for exactly this account (email, else credential file name), or null. */
+  #perAccountExit(account) {
+    const perAccount = this.config.upstream.egress?.accounts ?? {};
     const byEmail = account?.email ? perAccount[account.email] : undefined;
     const byFile = account?.id ? perAccount[path.basename(account.id)] : undefined;
-    return byEmail ?? byFile ?? egress.url ?? null;
+    return byEmail ?? byFile ?? null;
+  }
+
+  /**
+   * True when this deployment declares at least one exit (a per-account lane or a global url). From
+   * that moment an account that resolves to no exit is a configuration gap, not a request to dial
+   * from the host IP, so the relay fails closed for it. A deployment that declares no egress at all
+   * is the plain local relay the README documents: there the host IP is the documented exit.
+   */
+  #egressPolicyInForce() {
+    const egress = this.config.upstream.egress ?? {};
+    const perAccount = egress.accounts;
+    if (perAccount && typeof perAccount === 'object' && Object.keys(perAccount).length > 0) return true;
+    return typeof egress.url === 'string' && egress.url !== '';
   }
 
   /**
    * Effective egress identity. Two authenticated proxy sessions can share host:port, so the private
    * key is the whole configured URL (including credentials). Only `alias` may be journaled.
+   *
+   * An account refused by `syncEgress` (its exit is already used by an earlier account) has no
+   * usable exit, so its identity is empty: the shared lane must never be gated or cooled because
+   * of the account that was refused the use of it.
    */
   egressIdentityFor(account) {
+    if (this.egressRefused?.has(account?.id)) return { key: null, alias: 'egress-duplicate' };
     const url = this.egressFor(account);
-    if (!url) return { key: null, alias: 'direct' };
+    if (!url) return { key: null, alias: this.#egressPolicyInForce() ? 'egress-missing' : 'direct' };
     return {
       key: url,
       alias: `egress-${createHash('sha256').update(url).digest('hex').slice(0, 8)}`,
     };
   }
 
+  /**
+   * Resolves every account's effective egress identity and enforces the owner rule that two
+   * accounts of one service never share an exit: the first account of a lane keeps it, later
+   * accounts resolving to the same lane URL are refused and fail closed. A missing exit in a
+   * deployment that declares exits is refused the same way (no direct dial).
+   *
+   * A configuration mistake must not take the whole relay down, so this never throws: it records
+   * refusals, journals them (aliases only, one line per transition) and returns the report. Called
+   * at start-up and on every credential load, so a changed credential set re-decides.
+   */
+  syncEgress(accounts) {
+    const claimed = new Map(); // egress key -> alias of the account that keeps it
+    const refused = new Map(); // account id -> { alias, egressAlias, first }
+    const missing = [];
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const url = this.egressFor(account);
+      if (!url) {
+        if (this.#egressPolicyInForce()) missing.push(accountLabel(account));
+        continue;
+      }
+      const egressAlias = `egress-${createHash('sha256').update(url).digest('hex').slice(0, 8)}`;
+      const first = claimed.get(url);
+      if (first === undefined) {
+        claimed.set(url, accountLabel(account));
+        continue;
+      }
+      refused.set(account.id, { alias: accountLabel(account), egressAlias, first });
+    }
+    const known = new Set([...refused.values()].map((entry) => `dup:${entry.alias}:${entry.egressAlias}`)
+      .concat(missing.map((alias) => `missing:${alias}`)));
+    this.egressRefused = refused;
+    if (this.egressReported && known.size === this.egressReported.size
+      && [...known].every((entry) => this.egressReported.has(entry))) {
+      return { refused: [...refused.keys()], missing };
+    }
+    this.egressReported = known;
+    for (const { alias, egressAlias, first } of refused.values()) {
+      this.logger?.error?.('egress.duplicate', {
+        account: alias,
+        egress: egressAlias,
+        first,
+        reason: 'egress_invalid_config',
+        action: 'refused_fail_closed',
+        policyVersion: POLICY_VERSION,
+      });
+    }
+    for (const alias of missing) {
+      this.logger?.error?.('egress.missing', {
+        account: alias,
+        reason: 'egress_unavailable',
+        action: 'refused_fail_closed',
+        policyVersion: POLICY_VERSION,
+      });
+    }
+    return { refused: [...refused.keys()], missing };
+  }
+
+  /**
+   * An account without a usable exit in an egress-policied deployment, or one refused a shared
+   * lane, never reaches the wire: no OAuth refresh, no project probe, no generation from the host
+   * IP. It is an egress failure, not a credential penalty, so another account serves.
+   */
+  #assertEgress(account, phase) {
+    const duplicate = this.egressRefused?.has(account?.id) === true;
+    const missing = !this.egressFor(account) && this.#egressPolicyInForce();
+    if (!duplicate && !missing) return;
+    throw new UpstreamError('account has no usable egress exit', {
+      origin: 'egress',
+      phase,
+      reason: duplicate ? 'egress_invalid_config' : 'egress_unavailable',
+      scope: 'egress',
+      evidence: 'egress_config',
+      publicStatus: 502,
+      retryable: false,
+      accountId: account?.id ?? null,
+      generation: generationOf(account),
+    });
+  }
+
   /** fetch-shaped call through the account's egress (the oauth refresh must not leave from the host IP). */
   #fetchVia(egressUrl) {
+    // An account without an exit never gets here: #assertEgress refuses it first. A global-egress
+    // deployment reaches the node:https tunnel; a deployment with no egress at all is the plain
+    // local relay and uses the host connection, as documented.
     if (!egressUrl) return globalThis.fetch;
     return (url, { method = 'GET', headers = {}, body, signal } = {}) =>
       this.request(url, { method, headers, body: body == null ? undefined : String(body), signal, egressUrl });
@@ -227,6 +335,14 @@ export class UpstreamClient {
     if (signal?.aborted) throw abortFailure(signal);
     const egressUrl = accountEgress !== undefined ? accountEgress : (this.config.upstream.egress?.url ?? null);
     if (!egressUrl) {
+      // no egress url at all, but the deployment declares per-account exits: dialling from the host
+      // IP would be the fail-open the owner rule forbids, so there is no connection to make
+      if (this.#egressPolicyInForce()) {
+        throw new UpstreamError('no egress exit is available for this request', {
+          origin: 'egress', phase: 'connect', reason: 'egress_unavailable', scope: 'egress',
+          evidence: 'egress_config', publicStatus: 502, retryable: false,
+        });
+      }
       return globalThis.fetch(url, { method, headers, body, signal });
     }
     // node:https path (egress configured)
@@ -328,6 +444,8 @@ export class UpstreamClient {
   }
 
   async accessToken(account, { fetchImpl = this.#fetchVia(this.egressFor(account)), budget = null } = {}) {
+    // An account with no usable exit must not even refresh: the token POST would leave from the host IP.
+    this.#assertEgress(account, 'refresh');
     this.#assertCurrent(account, 'refresh');
     const generation = generationOf(account);
     const cached = this.tokens.get(account.id);
@@ -434,6 +552,8 @@ export class UpstreamClient {
    * its request and body read.
    */
   async ensureProject(account, { signal, budget = null } = {}) {
+    // the decision loop may reach here on an account that `syncEgress` refused a lane
+    this.#assertEgress(account, 'project_resolution');
     this.#assertCurrent(account, 'project_resolution');
     const generation = generationOf(account);
     if (account.projectId) return account.projectId;
@@ -543,6 +663,9 @@ export class UpstreamClient {
   async #doFetch({ url, token, body, account, fetchImpl, signal, stream, budget, beforeDispatch, meta }) {
     // a request cancelled before it started (client gone, deadline spent) never reaches the wire
     if (signal?.aborted) throw abortFailure(signal);
+    // Last gate before the wire: an account that lost its exit (refused a lane, or a mapping that no
+    // longer resolves) fails closed here instead of falling back to a direct dial.
+    this.#assertEgress(account, 'dispatch');
     // enforce requestTimeoutMs (C2), combined with any client signal
     let combined = signal ?? null;
     if (typeof AbortSignal?.timeout === 'function') {

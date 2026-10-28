@@ -21,6 +21,19 @@ const upstream = new UpstreamClient({
 });
 const pool = new AccountPool({ logger });
 
+/**
+ * Start-up egress resolution: every account's exit is decided from the loaded credential set, so a
+ * lane shared by two accounts is refused before any request is served. A failure to read the
+ * credentials is not fatal here - `/health` reports it and the handler loads them again per request.
+ */
+let startup = null;
+try {
+  const accounts = credentialStore.readAll();
+  startup = { accounts, report: upstream.syncEgress(accounts) };
+} catch (error) {
+  logger.warn('credentials.missing', { reason: errorCategory(error) });
+}
+
 const server = createServer({ config, credentialStore, upstream, pool, logger });
 
 server.listen(config.listen.port, config.listen.host, () => {
@@ -28,22 +41,22 @@ server.listen(config.listen.port, config.listen.host, () => {
     listen: `${config.listen.host}:${config.listen.port}`,
     upstream: config.upstream.baseUrl,
   });
-  try {
-    const accounts = credentialStore.readAll();
-    // payload-free: the journal gets the account labels (acct-<hash>), never emails or token file
-    // paths. Which credential a label belongs to is an operator question, answered on the host.
-    logger.info('credentials.loaded', {
-      count: accounts.length,
-      accounts: accounts.map((a) => accountLabel(a)),
-      projects: accounts.map((a) => (a.projectId ? 'set' : 'missing')),
-      // exit per account, protocol and host:port only (a proxy url may carry credentials)
-      egress: accounts.map((a) => {
-        const url = upstream.egressFor(a);
-        if (!url) return 'direct';
-        try { const u = new URL(url); return `${u.protocol}//${u.host}`; } catch { return 'invalid'; }
-      }),
-    });
-  } catch (error) {
-    logger.warn('credentials.missing', { reason: errorCategory(error) });
-  }
+  if (!startup) return;
+  const { accounts } = startup;
+  // payload-free: the journal gets the account labels (acct-<hash>), never emails or token file
+  // paths. Which credential a label belongs to is an operator question, answered on the host.
+  logger.info('credentials.loaded', {
+    count: accounts.length,
+    accounts: accounts.map((a) => accountLabel(a)),
+    projects: accounts.map((a) => (a.projectId ? 'set' : 'missing')),
+    // exit per account, protocol and host:port only (a proxy url may carry credentials); 'none'
+    // is an unmapped account in a deployment that declares exits, 'refused' one that lost its lane
+    // to an earlier account. Both fail closed; syncEgress already journaled the detail.
+    egress: accounts.map((a) => {
+      if (upstream.egressRefused?.has(a.id)) return 'refused';
+      const url = upstream.egressFor(a);
+      if (!url) return 'none';
+      try { const u = new URL(url); return `${u.protocol}//${u.host}`; } catch { return 'invalid'; }
+    }),
+  });
 });

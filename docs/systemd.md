@@ -59,3 +59,9 @@ either edit `config.json` (copy from `config.example.json`) or use env vars in t
 | `ANTIGRAVITY_PROXY_API_KEY` | require this key from clients | none |
 | `ANTIGRAVITY_PROXY_LOG_LEVEL` | debug/info/warn/error | info |
 | `ANTIGRAVITY_PROXY_UPSTREAM` | override cloud-code base url | daily-cloudcode-pa.googleapis.com |
+| `ANTIGRAVITY_PROXY_VERTEX_FALLBACK` | vertex fallback: a url enables the relay it names, `on`/`true`/`1` enable the configured url, `off`/`none` disable | off |
+
+the fallback is off by default: it switches provider and strips the model's effort suffix, so enabling
+it is a deliberate decision. per-account exits (`upstream.egress.accounts` in `config.json`) are not
+env-configurable; the relay refuses an account with no exit and an account whose exit another account
+already holds (`egress.duplicate` in the journal), and keeps serving the rest.

@@ -62,6 +62,26 @@ selection is sticky-first, not round-robin: `pool.select` returns the first acco
 for the requested model, project and egress and was not tried by this request. one account serving a
 run of requests keeps gemini's per-account implicit prompt cache warm.
 
+## egress resolution: fail closed, one exit per account
+
+`UpstreamClient.syncEgress(accounts)` resolves every account's effective exit and enforces both owner
+rules where the identity is known - at start-up (`src/cli.js`) and again on every credential load in
+`handleWithRotation`, because the store re-reads the token files per request:
+
+- once the config declares any exit, an account resolving to none is refused before OAuth, project
+  resolution or generation - `egress_unavailable`, scope `egress`, no credential penalty, so another
+  account serves. a config with no egress at all is the plain local relay and uses the host connection.
+- the first account of an exit url keeps it; a later account resolving to the same url is refused
+  (`egress_invalid_config`) and `egress.duplicate` names both aliases. accounts sharing one global
+  `upstream.egress.url` collide the same way, so they need per-account lanes. the process keeps serving
+  the accounts that have their own exit.
+- `#assertEgress` is the gate on all three wire paths (`accessToken`, `ensureProject`, `#doFetch`), and
+  `request()` refuses a direct dial in an egress-policied deployment as a backstop.
+- refusals are journalled once per transition (aliases and the `egress-<hash>` lane only), and
+  `egressIdentityFor` returns no key for a refused account, so the lane its owner uses is never gated
+  on the refused account's behalf. a local egress-config observation spends no shared failed-account
+  budget: it proves nothing about account health.
+
 `src/upstream/failure.js` is the one failure contract. only trusted structured fields classify:
 observed HTTP status, the exact `error.status` enum of a parsed JSON error body, an exact top-level
 OAuth error code, or a local observation (parse failure, egress stage, deadline). messages are never
@@ -85,6 +105,7 @@ An embedded error code is classified separately: HTTP200 carrying `error.code=42
 | exact token-endpoint `invalid_grant` | alternate | block that credential generation |
 | OAuth timeout/429/5xx/malformed | alternate with the refresh class | none |
 | proven egress dial/CONNECT failure | alternate on another pinned egress | that egress only |
+| account with no exit, or a lane another account holds | alternate on an account with its own exit | none |
 | ambiguous 403/permission/model | alternate or explicit failure | none |
 
 unknown, protocol and transient failures share one request-local failed-account budget of two. for N

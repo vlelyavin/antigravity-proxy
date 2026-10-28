@@ -24,6 +24,20 @@ function deepMerge(base, extra) {
   return out;
 }
 
+/**
+ * A full copy of the merged config. `deepMerge` shallow-copies every level it does not touch, so a
+ * nested object (for example `fallback`, with no file-provided keys) would still be the module-level
+ * DEFAULTS object - and any later override would edit the defaults for the rest of the process,
+ * making "off by default" depend on which config happened to load first.
+ */
+function cloneConfig(value) {
+  if (Array.isArray(value)) return value.map(cloneConfig);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, cloneConfig(v)]));
+  }
+  return value;
+}
+
 export function loadConfig({ configPath = null, env = process.env } = {}) {
   let fileConfig = {};
   const candidates = [
@@ -40,7 +54,8 @@ export function loadConfig({ configPath = null, env = process.env } = {}) {
     }
   }
 
-  const config = deepMerge(DEFAULTS, fileConfig);
+  // fully detached from DEFAULTS: the env overrides below must never edit the shipped defaults
+  const config = cloneConfig(deepMerge(DEFAULTS, fileConfig));
 
   // env overrides
   if (env.ANTIGRAVITY_PROXY_PORT) config.listen.port = Number(env.ANTIGRAVITY_PROXY_PORT);
@@ -48,8 +63,18 @@ export function loadConfig({ configPath = null, env = process.env } = {}) {
   if (env.ANTIGRAVITY_PROXY_API_KEY) config.apiKey = env.ANTIGRAVITY_PROXY_API_KEY;
   if (env.ANTIGRAVITY_PROXY_LOG_LEVEL) config.logLevel = env.ANTIGRAVITY_PROXY_LOG_LEVEL;
   if (env.ANTIGRAVITY_PROXY_UPSTREAM) config.upstream.baseUrl = env.ANTIGRAVITY_PROXY_UPSTREAM;
-  if (env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK === 'off' || env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK === 'none') config.fallback.enabled = false;
-  else if (env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK) config.fallback.vertexUrl = env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK;
+  // Vertex fallback is off unless something says otherwise: an off/none value keeps it off, a url
+  // is an explicit "relay here" instruction (so it enables the relay it names), and a bare switch
+  // (on/true/1) enables the configured vertexUrl. Nothing here can enable it by accident.
+  const fallbackSwitch = env.ANTIGRAVITY_PROXY_VERTEX_FALLBACK;
+  if (fallbackSwitch === 'off' || fallbackSwitch === 'none') {
+    config.fallback.enabled = false;
+  } else if (fallbackSwitch === 'on' || fallbackSwitch === 'true' || fallbackSwitch === '1') {
+    config.fallback.enabled = true;
+  } else if (fallbackSwitch) {
+    config.fallback.vertexUrl = fallbackSwitch;
+    config.fallback.enabled = true;
+  }
 
   if (!Number.isInteger(config.listen.port) || config.listen.port < 0 || config.listen.port > 65535) {
     throw new Error(`invalid listen.port: ${config.listen.port}`);

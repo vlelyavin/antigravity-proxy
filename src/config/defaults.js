@@ -33,7 +33,12 @@ export const DEFAULTS = {
     // optional outbound proxy for ALL upstream traffic (hides the host IP):
     // url: 'socks5://127.0.0.1:1055' | 'http://user:pass@host:port' | null
     // per-account override: accounts: { '<email>': '<proxy-url>', '<filename>.json': '<proxy-url>' }
-    // (matched by email or file BASENAME INCLUDING extension; unknown key = silently global)
+    // (matched by email or file BASENAME INCLUDING extension; unknown key = the global url)
+    //
+    // Once accounts are declared here every account must have its own exit: an account without one
+    // fails closed as an egress failure instead of dialling from the host IP, and two accounts on
+    // one lane are refused (the client keeps the first). With no egress configured at all the relay
+    // is a plain local relay and the host IP is the exit.
     egress: { url: null },
   },
 
@@ -42,9 +47,14 @@ export const DEFAULTS = {
   // Last-resort relay when the whole antigravity account pool is exhausted
   // (all accounts 429/cooling/failing). Only fires for gemini-family models —
   // the target is a Vertex OpenAI-compatible endpoint, non-gemini ids would 400.
+  //
+  // Disabled by default: switching provider silently and downgrading the model tier (the target
+  // cannot serve the -low/-medium/-high effort suffix) is a product decision, not a default. Turn
+  // it on explicitly with `fallback.enabled: true` in config.json or
+  // ANTIGRAVITY_PROXY_VERTEX_FALLBACK=<vertex-url> in the environment.
   fallback: {
     vertexUrl: 'http://127.0.0.1:18804/v1/chat/completions',
-    enabled: true,
+    enabled: false,
     timeoutMs: 120_000,
   },
 

@@ -94,6 +94,16 @@ two kinds of state stay separate:
 - **request-local**: the accounts this one request already tried. it never changes shared health.
 - **shared and scoped**: a proven restriction on exactly one account, account+model, project resource or egress identity. an unknown failure never widens into account state.
 
+### egress: one exit per account, fail closed
+
+`upstream.egress.accounts` maps an account (email, else the token file's basename including `.json`) to its own proxy url, so every account reaches google from its own ip. the rules are checked at start-up and again on every credential load, and they refuse an account rather than leak the host ip:
+
+- **no exit, no traffic.** once the deployment declares any exit, an account that resolves to none is refused (`egress_unavailable`, scope `egress`, no credential penalty) before oauth, project resolution or generation runs. a deployment that declares no egress at all is the plain local relay and uses the host connection.
+- **one exit, one account.** the first account of a lane keeps it; a later account resolving to the same url is refused (`egress_invalid_config`) and the journal carries one `egress.duplicate` error line naming both aliases and the `egress-<hash>` lane. several accounts inheriting one global `upstream.egress.url` share that exit and are refused the same way - give them per-account lanes instead. the relay keeps serving the accounts that do have their own exit: the mistake is per lane, never fatal to the process.
+- two authenticated sessions on one host:port are different urls, so they are different exits and never collide.
+
+a refused account is journalled once per transition (`egress.duplicate` / `egress.missing`), not once per request; emails, token paths and proxy urls never reach the line.
+
 the failure policy:
 
 | observation | request action | shared state |
@@ -108,6 +118,7 @@ the failure policy:
 | exact structured token-endpoint `invalid_grant` | alternate | that material credential generation is blocked until the refresh token changes or an operator retries |
 | OAuth timeout/429/5xx/malformed | bounded alternate with the refresh failure class | none |
 | proven egress dial/CONNECT failure | alternate on another pinned egress | that egress only; never a direct fallback |
+| account with no exit, or a lane another account holds | alternate on an account that has its own exit; never a direct dial | none: a configuration mistake is not the credential's health |
 | ambiguous 403/permission/model error | bounded alternate or explicit failure | none |
 
 only a reviewed scoped provider quota signal may cool an account/model/project, and no genuine AGY quota metadata is established yet: the scoped quota branch is contract vocabulary and is not activated by convenient fixture fields.
@@ -165,6 +176,16 @@ sudo ./scripts/install-systemd.sh
 ```
 
 one command — writes the unit, enables, starts. manual path in `docs/systemd.md`.
+
+## vertex fallback: off by default
+
+the relay can hand an exhausted pool to a local Vertex OpenAI-compatible endpoint, but that switches provider and drops the model tier (the effort suffixes `-low`/`-medium`/`-high` are stripped for it), so it is **disabled unless you say otherwise**. turn it on explicitly:
+
+```json
+{ "fallback": { "enabled": true, "vertexUrl": "http://127.0.0.1:18804/v1/chat/completions" } }
+```
+
+or with `ANTIGRAVITY_PROXY_VERTEX_FALLBACK=<vertex-url>` (a url enables the relay it names; `on`/`true`/`1` enable the configured url; `off`/`none` keep it off). when it answers, the response carries `x-agy-route: vertex_fallback` and the journal records `route: vertex_fallback`, so a switched request is auditable afterwards.
 
 ## structure
 

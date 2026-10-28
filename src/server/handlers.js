@@ -385,6 +385,10 @@ export async function handleWithRotation({
     // missing/corrupt credential files: the pool is empty — still fall back
     storeError = error;
   }
+  // Credential reload path: the store re-reads the token files per request, so a credential set
+  // that changed since start-up is re-checked here. A lane two accounts share is refused for the
+  // later account (fail closed) before it can serve; the first one keeps it.
+  if (Array.isArray(accounts) && typeof upstream.syncEgress === 'function') upstream.syncEgress(accounts);
   const budget = createDispatchBudget({ credentials: Array.isArray(accounts) ? accounts.length : 0 });
   const tried = new Set();
   const authRetried = new Set();
