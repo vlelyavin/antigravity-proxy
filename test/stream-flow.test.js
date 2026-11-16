@@ -12,7 +12,7 @@ import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { createFlowWatchdog } from '../src/server/handlers.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 const ACCOUNTS = [
   { generation: 'synthetic', id: 'a0', email: 'first@example.com', projectId: 'p' },

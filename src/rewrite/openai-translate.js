@@ -3,6 +3,8 @@
 // splicing — same principle as claude-proxy.
 
 import { findModel } from './models.js';
+import { scrubIdentity } from './identity-scrub.js';
+import { fnv1aInt64 } from '../upstream/trajectory.js';
 
 // Gemini 3.x tool-call replay requires a thoughtSignature on every functionCall
 // part. Real signatures arrive in responses; clients can't roundtrip them, so
@@ -182,7 +184,11 @@ function partsFromContent(content) {
   return [];
 }
 
-export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort, reasoning, response_format }, { projectId, sessionId }) {
+export function openAiToAntigravity({ model, messages, max_tokens, max_completion_tokens, temperature, top_p, stop, tools, tool_choice, reasoning_effort, reasoning, response_format }, { projectId, sessionId, cascadeId, trajectoryId, stepIndex = 0, modelEnum, identityScrub = null } = {}) {
+  // Standalone callers (tests, one-off scripts) may omit the trajectory: mint one.
+  cascadeId = cascadeId ?? crypto.randomUUID();
+  trajectoryId = trajectoryId ?? crypto.randomUUID();
+  sessionId = sessionId ?? fnv1aInt64(cascadeId);
   // 2026-10-17 Vova: effort picks the suffixed upstream model; no explicit thinking
   // budget is sent - Google decides how much to think. off/minimal/low fold onto
   // low, so "no reasoning" still gets the cheapest thinking model.
@@ -268,17 +274,22 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
   }
 
   const generationConfig = {};
+  const kind = catalogEntry?.kind ?? 'gemini';
   if (catalogEntry) {
-    // wire defaults captured from the official CLI (see models.js)
-    generationConfig.maxOutputTokens = Number.isFinite(budget)
+    // Wire defaults captured from the official CLI (2026-10-30): the ceiling is the model's own
+    // maxOutputTokens, not the caller's max_tokens - the CLI always sends the full ceiling.
+    generationConfig.maxOutputTokens = Number.isFinite(budget) && budget > catalogEntry.maxOutputTokens
       ? budget
       : catalogEntry.maxOutputTokens;
-    // 2026-10-17: pass the reasoning level explicitly (Gemini 3 API field). Google
-    // decides the actual depth; includeThoughts keeps reasoning parts flowing back
-    // to clients as reasoning_content. NEVER send thinkingBudget here: it is
-    // deprecated for Gemini 3 and intermittent 400 INVALID_ARGUMENT comes from it.
-    generationConfig.thinkingConfig = { includeThoughts: true };
-    if (effortLevel) generationConfig.thinkingConfig.thinkingLevel = effortLevel;
+    // Gemini 3 takes thinkingLevel (low/medium/high, UPPERCASE on the wire) next to a zero
+    // thinkingBudget; the Claude bridge takes a fixed 1024 budget and NO level. Both shapes were
+    // captured from the CLI, so they are reproduced verbatim.
+    if (kind === 'claude') {
+      generationConfig.thinkingConfig = { includeThoughts: true, thinkingBudget: catalogEntry.budget };
+    } else {
+      generationConfig.thinkingConfig = { includeThoughts: true, thinkingBudget: 0 };
+      if (effortLevel) generationConfig.thinkingConfig.thinkingLevel = effortLevel.toUpperCase();
+    }
   } else {
     if (Number.isFinite(budget)) generationConfig.maxOutputTokens = budget;
   }
@@ -301,13 +312,28 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     }
   }
 
+  // The CLI wraps the live turn in <USER_REQUEST> and appends the local clock as
+  // <ADDITIONAL_METADATA>; the backend sees that shape on every real agent request.
+  const lastUser = contents.map((c, i) => (c.role === 'user' ? i : -1)).filter((i) => i >= 0).pop();
+  if (lastUser !== undefined) {
+    const parts = contents[lastUser].parts;
+    const textIndex = parts.findIndex((p) => typeof p.text === 'string');
+    if (textIndex >= 0) {
+      const text = parts[textIndex].text;
+      parts[textIndex] = {
+        text: `<USER_REQUEST>\n${text}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: ${new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')}.\n</ADDITIONAL_METADATA>`,
+      };
+    }
+  }
+
   const request = {
     contents,
-    generationConfig,
-    sessionId,
   };
   if (systemText.length > 0) {
-    request.systemInstruction = { parts: [{ text: systemText.join('\n\n') }] };
+    request.systemInstruction = {
+      role: 'user',
+      parts: [{ text: systemText.map((text) => scrubIdentity(text, identityScrub ?? {})).join('\n\n') }],
+    };
   }
 
   if (Array.isArray(tools) && tools.length > 0) {
@@ -324,13 +350,32 @@ export function openAiToAntigravity({ model, messages, max_tokens, max_completio
     if (fns.length > 0) request.tools = [{ functionDeclarations: fns }];
   }
 
+  // Trajectory labels: the CLI stamps every request with them, and they are the one field that
+  // tells the backend this is an agent session rather than an anonymous script.
+  const step = String(stepIndex);
+  const isClaude = kind === 'claude';
+  request.labels = {
+    cascade_id: cascadeId,
+    last_step_index: step,
+    model_enum: modelEnum ?? catalogEntry?.modelEnum ?? 'MODEL_PLACEHOLDER_M319',
+    request_id: `${trajectoryId}-${step}`,
+    root_cascade_id: cascadeId,
+    trajectory_id: trajectoryId,
+    used_claude: String(isClaude),
+    used_claude_conservative: String(isClaude),
+    used_non_gemini_model: String(kind !== 'gemini'),
+  };
+  request.generationConfig = generationConfig;
+  request.sessionId = sessionId;
+
+  // Key order matches the CLI envelope byte for byte.
   return {
+    project: projectId,
+    requestId: `agent/${cascadeId}/${Date.now()}/${trajectoryId}/${step}`,
+    request,
     model: catalogEntry ? (catalogEntry.upstreamModel ?? catalogEntry.id) : model,
     userAgent: 'antigravity',
     requestType: 'agent',
-    project: projectId,
-    requestId: `agent-${crypto.randomUUID()}`,
-    request,
   };
 }
 

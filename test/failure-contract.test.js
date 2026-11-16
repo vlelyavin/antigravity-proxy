@@ -221,8 +221,15 @@ test('journal helpers keep model fields inside their allowlists', () => {
 });
 
 
-test('unsupported broad restriction vocabulary cannot activate shared state', () => {
-  for (const reason of ['account_restricted', 'project_restricted', 'provider_unavailable']) {
+test('only an explicit TOS enum activates a shared account block', () => {
+  const tos = decideFailure(new UpstreamError('synthetic', {
+    reason: 'account_restricted', scope: 'account', evidence: 'error_status_tos_violation', publicStatus: 502,
+  }));
+  assert.equal(tos.sharedEffect, 'restrict_account');
+  assert.equal(tos.sharedScope, 'account');
+  assert.equal(tos.until, null, 'a TOS block is not a timer');
+  assert.equal(tos.budget, 'none');
+  for (const reason of ['project_restricted', 'provider_unavailable']) {
     const decision = decideFailure(new UpstreamError('synthetic', {
       reason, scope: 'provider', evidence: 'pool_gate', publicStatus: 502,
     }));

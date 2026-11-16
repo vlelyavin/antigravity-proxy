@@ -13,7 +13,7 @@ import { createServer } from '../src/server/create-server.js';
 import { accountLabel } from '../src/utils/alias.js';
 import { EGRESS_COOLDOWN_MS } from '../src/upstream/rotation-policy.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const VALID_ID = '9f1c2d3e-4a5b-4c6d-8e7f-102132435465';
 const STREAM_OK = [{ response: { candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] } }];

@@ -8,7 +8,10 @@ you have a google ai pro subscription. your tools want an openai endpoint. this 
 
 - reads your local antigravity/gemini oauth token from disk on every request — a fresh login elsewhere needs no restart
 - translates openai `chat/completions` ↔ cloud code `generateContent` structurally, both directions, including tool calls and images
-- streams: openai SSE out of the cloud-code SSE frames
+- streams: openai SSE out of the cloud-code SSE frames, and the native Gemini `:streamGenerateContent` lane passes the upstream frames through
+- scrubs harness identity from the system instruction (`Nous Research`, `Hermes`, `Claude Code`, `Anthropic`, …) before dispatch: cloud code answers an opaque 429 to some of those markers
+- structural quota evidence (a `QuotaFailure` / `QUOTA_EXHAUSTED` enum or a reset timestamp in `error.details[]`) parks that account+model until the upstream reset time instead of re-hitting it
+- a `403 TOS_VIOLATION` / `UNSUPPORTED_CLIENT` parks the account until an operator clears it, and the turn moves to another account; scoped state survives a restart
 - multi-account, sticky-first: the first eligible account serves a run of requests, and the rest are the overflow — drop N token files in and all of them are candidates
 - evidence-scoped rotation: a bare 429 rotates inside the request without guessing a quota owner; only an exact token-endpoint `invalid_grant` blocks that credential generation, and a proven egress failure gates that egress only
 - bounds a held-open socket: the wait for the first meaningful frame and the gap between frames
@@ -57,6 +60,17 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 
 a `pong` means the whole path works.
 
+the native gemini lane and the read-only quota snapshot:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash:generateContent \
+  -H 'content-type: application/json' \
+  --data '{"contents":[{"role":"user","parts":[{"text":"reply with exactly: pong"}]}]}'
+curl -sS http://127.0.0.1:8317/v1/quota
+```
+
+`:streamGenerateContent` on the same path answers native Gemini SSE frames. `/v1/quota` returns the `retrieveUserQuotaSummary` answers collected by the start-up warm-up (`upstream.warmup: true`); it never makes a fresh upstream call and carries account aliases, not emails.
+
 ## wire it into tools
 
 openai-compatible base url `http://127.0.0.1:8317/v1`, api key — whatever you set (or `none`).
@@ -83,7 +97,9 @@ hermes / any openai sdk: `base_url=http://127.0.0.1:8317/v1`, `api_key=none`, mo
 
 ## models
 
-`gemini-3.8-flash-{low,medium,high}`, `gemini-3.7/3.6-flash-*`, `gemini-3-flash`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. the list lives in `src/rewrite/models.js` — extend it when google ships more.
+`gemini-3.8-flash-{low,medium,high,tiered}`, `gemini-4-{argon,hydrogen,carbon}-*`, `gemini-3-flash`, `gemini-3.1-flash-image`, `gemini-3.1/3.5-flash-lite`, `gemini-3.7/3.6-flash-*`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-5-5-high`, `claude-opus-5-5-high`. the list lives in `src/rewrite/models.js` — extend it when google ships more.
+
+google removes Claude Sonnet/Opus 4.6 and GPT-OSS-120B from antigravity on **2026-11-18**; the catalog carries their replacements instead. plan availability is per account: gemini 4 carbon, 3.7/3.6 flash and 3.1 pro are enterprise-only, and gemini 4 argon plus claude 5.5 need a paid (non-trial) AI Pro or Ultra plan.
 
 ## multi-account
 
@@ -114,6 +130,8 @@ the failure policy:
 | truncated/malformed/unknown terminal | bounded alternate | none |
 | generic 5xx, unknown network/body failure | bounded alternate | none |
 | bare 429 / `RESOURCE_EXHAUSTED` with no scoped evidence | request-local alternate only | none: the quota owner is unknown |
+| structured quota: `QuotaFailure` / `QUOTA_EXHAUSTED` / a reset timestamp in `error.details[]` | alternate; the quota owner is known | that account+model is parked until the upstream reset time, or `rotation.quotaCooldownMs` when the answer has no reset hint |
+| `403 TOS_VIOLATION` / `UNSUPPORTED_CLIENT` / `POLICY_VIOLATION` enum | alternate; never a rate limit, never a refresh | that account is blocked until an operator clears the pool state; `rotation.tosPauseMs` pauses the whole pool too |
 | generation 401 / `UNAUTHENTICATED` | refresh once, retry this credential at most once; a second 401 avoids it for this request as `auth_rejected_after_refresh` | none |
 | exact structured token-endpoint `invalid_grant` | alternate | that material credential generation is blocked until the refresh token changes or an operator retries |
 | OAuth timeout/429/5xx/malformed | bounded alternate with the refresh failure class | none |
@@ -121,11 +139,15 @@ the failure policy:
 | account with no exit, or a lane another account holds | alternate on an account that has its own exit; never a direct dial | none: a configuration mistake is not the credential's health |
 | ambiguous 403/permission/model error | bounded alternate or explicit failure | none |
 
-only a reviewed scoped provider quota signal may cool an account/model/project, and no genuine AGY quota metadata is established yet: the scoped quota branch is contract vocabulary and is not activated by convenient fixture fields.
+only structured evidence from `error.details[]` may cool an account/model: a `QuotaFailure`/`QUOTA_EXHAUSTED` enum, a TOS enum, or a reset timestamp. the free-text `message` is never inspected, and a bare 429 never widens into shared state.
 
 unknown, protocol and transient failures share one request-local failed-account budget of **two**. for N credentials loaded at request entry the relay may issue at most **2N generation POSTs**, **2N OAuth token POSTs** and **N project-resolution POSTs**; one credential gets at most two generation POSTs, and the connection retry and the forced-auth retry share that allowance. a caller joining an in-flight shared refresh records a join, not another POST. the common deadline always wins. a transport retry may repeat a POST already received by the provider; it is counted as another potentially metered dispatch. an observed HTTP response never enters the connection retry.
 
-a restriction that expires admits exactly **one** real bounded attempt as a recovery probe. the lease lasts through that attempt and is released on success, failure, cancellation and timeout; expiry or release is not recovery. a successful probe clears only state whose evidence revision has not moved - a late success cannot erase a newer cooldown. a late failure for an old credential generation cannot disable a replaced one, and a normal access-token refresh is a new token version, not a material replacement. inferred availability is process-local in this slice: a restart emits `pool.reset` and clears it, which is an explicit reset, not a verified recovery.
+a restriction that expires admits exactly **one** real bounded attempt as a recovery probe. the lease lasts through that attempt and is released on success, failure, cancellation and timeout; expiry or release is not recovery. a successful probe clears only state whose evidence revision has not moved - a late success cannot erase a newer cooldown. a late failure for an old credential generation cannot disable a replaced one, and a normal access-token refresh is a new token version, not a material replacement. scoped state (quota parks, TOS blocks, credential blocks) is written to `state.poolPath` (mode 0600) and restored on start-up; a restart emits `pool.reset` with the restored count, and expired quota parks are dropped at load time. a TOS block has no timer by design - clear it explicitly:
+
+```bash
+node src/cli.js --clear-pool   # removes the persisted scoped state, then start the service again
+```
 
 every request has one total budget, `rotation.requestDeadlineMs` (default 110 s): preparation, all account attempts, the stream collection and the vertex fallback share it, and no frame or retry resets it. the default sits just under mari's 120 s turn - raise it for callers that legitimately wait longer. a spent budget answers 504 and penalizes no account: the accounts were not the problem.
 
@@ -193,9 +215,10 @@ or with `ANTIGRAVITY_PROXY_VERTEX_FALLBACK=<vertex-url>` (a url enables the rela
 src/
   config/         defaults, env overrides, loader
   credentials/    token file lookup (agy / gemini-cli / raw), oauth refresh
-  rewrite/        openai <-> cloud-code transforms + model catalog
+  rewrite/        openai <-> cloud-code transforms, model catalog, identity scrub
   upstream/       cloud-code client, structured failure/policy, scoped pool
-  server/         http surface: /health, /v1/models, /v1/chat/completions
+  server/         http surface: /health, /v1/models, /v1/quota,
+                  /v1/chat/completions, /v1beta/models/{model}:{generateContent,streamGenerateContent}
 test/             node:test suite, no network needed (one local cert fixture)
 ```
 

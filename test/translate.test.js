@@ -9,12 +9,12 @@ test('simple user message maps to contents with user role', () => {
     { projectId: 'proj', sessionId: '-123' },
   );
   assert.equal(body.request.contents[0].role, 'user');
-  assert.equal(body.request.contents[0].parts[0].text, 'ping');
+  assert.match(body.request.contents[0].parts[0].text, /^<USER_REQUEST>\nping\n<\/USER_REQUEST>/);
   assert.equal(body.model, 'gemini-3.8-flash-high');
   assert.equal(body.project, 'proj');
   assert.equal(body.userAgent, 'antigravity');
   assert.equal(body.requestType, 'agent');
-  assert.ok(body.requestId.startsWith('agent-'));
+  assert.match(body.requestId, /^agent\/[0-9a-f-]{36}\/\d+\/[0-9a-f-]{36}\/0$/);
   assert.equal(body.request.sessionId, '-123');
 });
 
@@ -126,7 +126,7 @@ test('final stream chunk carries usage and finish_reason', () => {
 test('models payload lists the antigravity catalog', () => {
   const payload = modelsPayload();
   assert.ok(payload.data.some((m) => m.id === 'gemini-3.8-flash-high'));
-  assert.ok(payload.data.some((m) => m.id === 'claude-sonnet-4-6'));
+  assert.ok(payload.data.some((m) => m.id === 'claude-sonnet-5-5-high'));
 });
 
 test('a prompt-level block surfaces as content_filter with the reason, not as an empty stop', () => {

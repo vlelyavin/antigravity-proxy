@@ -1,11 +1,14 @@
 import path from 'node:path';
 import https from 'node:https';
+import zlib from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { newSessionId } from '../credentials/oauth.js';
 import { materialGeneration } from '../credentials/credential-store.js';
 import { canonicalModel, openAiToAntigravity } from '../rewrite/openai-translate.js';
 import { errorCategory } from '../utils/error-category.js';
 import { dropIdleSockets, makeEgressAgent } from './egress.js';
+import { TrajectoryStore, conversationKey } from './trajectory.js';
+import { Telemetry } from './telemetry.js';
 import { accountLabel } from '../utils/alias.js';
 import {
   POLICY_VERSION,
@@ -145,6 +148,15 @@ export class UpstreamClient {
     this.projects = new Map();
     // egressUrl -> agent
     this.agents = new Map();
+    // conversation -> cascade/session/step, so the wire carries an agent trajectory
+    this.trajectories = new TrajectoryStore();
+    this.telemetry = new Telemetry({
+      enabled: config.upstream?.telemetry === true,
+      version: process.env.AGY_CLI_VERSION || '1.3.3',
+      osType: process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux',
+      arch: process.arch === 'arm64' ? 'arm64' : 'amd64',
+      logger,
+    });
     // "<accountId>\0<generation>" -> in-flight refresh promise
     this.refreshing = new Map();
     this.tokenVersion = 0;
@@ -152,6 +164,8 @@ export class UpstreamClient {
     // accountId -> { alias, egressAlias, first }: accounts refused a lane another account holds
     this.egressRefused = new Map();
     this.egressReported = null; // last journaled egress configuration, so reloads stay quiet
+    // accountId -> { at, summary }: the last retrieveUserQuotaSummary answer, read-only telemetry
+    this.quotaByAccount = new Map();
   }
 
   #assertCurrent(account, phase) {
@@ -330,7 +344,7 @@ export class UpstreamClient {
    * node:https over the CONNECT tunnel, not global fetch: the tunnel is what production uses, and
    * fetch gives no handle to destroy a body that stalled after the headers.
    */
-  async request(url, { method = 'POST', headers = {}, body, signal, egressUrl: accountEgress }) {
+  async request(url, { method = 'POST', headers = {}, body, signal, egressUrl: accountEgress, stream = false }) {
     // an abort listener added after the fact never fires: refuse to start an already aborted request
     if (signal?.aborted) throw abortFailure(signal);
     const egressUrl = accountEgress !== undefined ? accountEgress : (this.config.upstream.egress?.url ?? null);
@@ -364,7 +378,7 @@ export class UpstreamClient {
         reject(abortFailure(signal));
       };
       /** Reads the whole body; a body cut by the peer keeps what arrived, an abort rejects. */
-      const readText = () => new Promise((resolveText, rejectText) => {
+      const readText = (source) => new Promise((resolveText, rejectText) => {
         if (signal?.aborted) { rejectText(abortFailure(signal)); return; }
         const chunks = [];
         let done = false;
@@ -373,18 +387,18 @@ export class UpstreamClient {
           if (done) return;
           done = true;
           signal?.removeEventListener('abort', onReadAbort);
-          response?.off('data', onData);
-          response?.off('end', onEnd);
-          response?.off('error', onReadError);
+          source?.off('data', onData);
+          source?.off('end', onEnd);
+          source?.off('error', onReadError);
           fn(value);
         };
         const onEnd = () => finish(resolveText, Buffer.concat(chunks).toString('utf8'));
         // a body cut by the peer keeps what arrived: the status still classifies the failure
         const onReadError = () => finish(resolveText, Buffer.concat(chunks).toString('utf8'));
         const onReadAbort = () => finish(rejectText, abortFailure(signal));
-        response.on('data', onData);
-        response.on('end', onEnd);
-        response.on('error', onReadError);
+        source.on('data', onData);
+        source.on('end', onEnd);
+        source.on('error', onReadError);
         signal?.addEventListener('abort', onReadAbort, { once: true });
       });
       request = https.request({
@@ -393,7 +407,8 @@ export class UpstreamClient {
         path: `${target.pathname}${target.search}`,
         method,
         headers: {
-          ...(payload !== null ? { 'content-length': Buffer.byteLength(payload) } : {}),
+          // the CLI streams the generate POST (chunked); only buffered calls carry a length
+          ...(payload !== null && !stream ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
           ...headers,
         },
         agent: this.agentFor(egressUrl),
@@ -401,10 +416,14 @@ export class UpstreamClient {
         response = res;
         const status = res.statusCode;
         const ok = { ok: status >= 200 && status < 300, status, headers: res.headers };
-        const buffered = status >= 300 || method !== 'POST' || headers.accept !== 'text/event-stream';
+        this.telemetry.send(String(headers.Authorization ?? headers.authorization ?? '').replace(/^Bearer /, ''),
+          { outcome: ok.ok ? 'ok' : 'error', fields: { status, model: body?.model ?? '' } });
+        // The CLI asks for gzip; decompress here so every consumer keeps seeing plain text/SSE.
+        const source = String(res.headers['content-encoding'] ?? '').includes('gzip') ? res.pipe(zlib.createGunzip()) : res;
+        const buffered = status >= 300 || method !== 'POST' || !stream;
         if (buffered) {
           // buffer non-stream bodies fully (error paths, non-stream chat)
-          readText().then(
+          readText(source).then(
             (text) => {
               if (settled) return;
               settled = true;
@@ -425,7 +444,7 @@ export class UpstreamClient {
         // The body is the caller's now, so the abort listener lives exactly as long as the response:
         // a normal completion and a destroyed body both close it, and neither leaves it behind.
         res.once('close', detach);
-        resolve({ ...ok, text: readText, json: async () => JSON.parse(await readText()), body: res, signal });
+        resolve({ ...ok, text: () => readText(source), json: async () => JSON.parse(await readText(source)), body: source, signal });
       });
       request.on('error', (error) => {
         if (settled) return;
@@ -618,10 +637,98 @@ export class UpstreamClient {
   async buildBody(openAiBody, account, { signal, projectId } = {}) {
     const resolved = projectId ?? await this.ensureProject(account, { signal });
     if (signal?.aborted) throw abortFailure(signal);
+    const model = canonicalModel(openAiBody.model);
+    // Same conversation -> same cascade and session id, next step: the shape the CLI sends.
+    const trajectory = this.trajectories.begin(conversationKey(openAiBody.messages, model));
     return openAiToAntigravity(
-      { ...openAiBody, model: canonicalModel(openAiBody.model) },
-      { projectId: resolved, sessionId: newSessionId() },
+      { ...openAiBody, model },
+      {
+        projectId: resolved,
+        sessionId: trajectory.sessionId,
+        cascadeId: trajectory.cascadeId,
+        trajectoryId: trajectory.trajectoryId,
+        stepIndex: trajectory.step,
+        identityScrub: this.config.upstream?.identityScrub ?? null,
+      },
     );
+  }
+
+  /**
+   * The CLI registers the trajectory before generating. Best effort: a failure here must not
+   * cost the turn, so it is awaited but never thrown.
+   */
+  async writeTrajectoryAcls(account, trajectoryId, { signal, egressUrl } = {}) {
+    if (!trajectoryId || this.config.upstream.trajectoryAcls !== true) return;
+    // A backend that ignores the route must not stall the turn: the call is capped and swallowed.
+    const capped = AbortSignal.timeout(5_000);
+    const combined = signal ? AbortSignal.any([signal, capped]) : capped;
+    try {
+      const token = await this.accessToken(account);
+      const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:writeTrajectoryAcls`;
+      const response = await this.request(url, {
+        method: 'POST',
+        headers: this.#wireHeaders(token),
+        body: JSON.stringify({ trajectoryId }),
+        signal: combined,
+        egressUrl: egressUrl ?? this.egressFor(account),
+      });
+      await response.text().catch(() => '');
+    } catch (error) {
+      this.logger.warn('trajectory.acls_failed', { account: accountLabel(account), reason: errorCategory(error) });
+    }
+  }
+
+  /**
+   * The CLI opens with fetchUserInfo / retrieveUserQuotaSummary / listExperiments before it ever
+   * generates. Replaying that once per account at start makes a fresh process look like a client
+   * starting up instead of a bare generator. Best effort, sequential, never throws.
+   */
+  async warmup(accounts) {
+    if (this.config.upstream?.warmup !== true) return;
+    for (const account of accounts) {
+      try {
+        const projectId = await this.ensureProject(account);
+        const token = await this.accessToken(account);
+        const egressUrl = this.egressFor(account);
+        for (const route of ['fetchUserInfo', 'retrieveUserQuotaSummary', 'listExperiments']) {
+          const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:${route}`;
+          const response = await this.request(url, {
+            method: 'POST',
+            headers: this.#wireHeaders(token),
+            body: JSON.stringify({ project: projectId }),
+            egressUrl,
+          });
+          const text = await response.text().catch(() => '');
+          if (route === 'retrieveUserQuotaSummary') {
+            try {
+              this.quotaByAccount.set(account.id, { at: new Date().toISOString(), summary: JSON.parse(text) });
+            } catch { /* a non-JSON quota answer is telemetry, not a failure */ }
+          }
+        }
+        this.logger.info('warmup.done', { account: accountLabel(account) });
+      } catch (error) {
+        this.logger.warn('warmup.failed', { account: accountLabel(account), reason: errorCategory(error) });
+      }
+    }
+  }
+
+  /** Read-only quota telemetry collected by warmup; never a fresh upstream call. */
+  quotaSnapshot() {
+    return [...this.quotaByAccount.entries()].map(([accountId, entry]) => ({
+      account: accountLabel(accountId),
+      at: entry.at,
+      summary: entry.summary,
+    }));
+  }
+
+  /** The exact header set and casing the official CLI puts on the wire. */
+  #wireHeaders(token, url = null) {
+    return {
+      'User-Agent': this.config.upstream.userAgent,
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'Accept-Encoding': 'gzip',
+    };
   }
 
   async generate({ openAiBody, account, fetchImpl, signal, budget = null, beforeDispatch = null, requestId = null }) {
@@ -653,6 +760,9 @@ export class UpstreamClient {
       egressKey: egress.key,
       egressAlias: egress.alias,
     };
+    // The CLI registers the trajectory before the generate call; the backend expects it.
+    await this.writeTrajectoryAcls(account, body?.request?.labels?.trajectory_id, { signal, egressUrl: this.egressFor(account) });
+    if (signal?.aborted) throw abortFailure(signal);
     const url = `${this.config.upstream.baseUrl}/${this.config.upstream.apiVersion}:`
       + (stream ? 'streamGenerateContent?alt=sse' : 'generateContent');
     return this.#doFetch({
@@ -672,13 +782,7 @@ export class UpstreamClient {
       const timeoutSignal = AbortSignal.timeout(this.config.upstream.requestTimeoutMs);
       combined = combined ? AbortSignal.any([combined, timeoutSignal]) : timeoutSignal;
     }
-    const headers = {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-      'user-agent': this.config.upstream.userAgent,
-      ...(meta?.requestId ? { 'x-request-id': meta.requestId } : {}),
-      ...(stream ? { accept: 'text/event-stream' } : {}),
-    };
+    const headers = this.#wireHeaders(token, url);
     const payload = JSON.stringify(body);
     const egressUrl = this.egressFor(account);
 
@@ -706,7 +810,7 @@ export class UpstreamClient {
           evidence: 'dispatch_budget', publicStatus: 503, accountId: account.id, generation: meta.generation,
         });
       }
-      return this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl });
+      return this.request(url, { method: 'POST', headers, body: payload, signal: combined, egressUrl, stream });
     };
 
     // A transport failure may have reached the provider: its one retry is another metered POST.
@@ -717,7 +821,11 @@ export class UpstreamClient {
       const response = await dispatch();
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
-      throw upstreamErrorFrom(response.status, text, account.id, response.headers, { generation: meta.generation });
+      throw upstreamErrorFrom(response.status, text, account.id, response.headers, {
+        generation: meta.generation,
+        model: meta.outboundModel,
+        quotaCooldownMs: this.config.rotation?.quotaCooldownMs ?? 0,
+      });
     } catch (error) {
       if (error instanceof UpstreamError) {
         if (error.observedStatus !== null || !CONNECTION_RETRYABLE.has(error.reason)) throw error;
@@ -740,7 +848,11 @@ export class UpstreamClient {
       const response = await dispatch();
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
-      throw upstreamErrorFrom(response.status, text, account.id, response.headers, { generation: meta.generation });
+      throw upstreamErrorFrom(response.status, text, account.id, response.headers, {
+        generation: meta.generation,
+        model: meta.outboundModel,
+        quotaCooldownMs: this.config.rotation?.quotaCooldownMs ?? 0,
+      });
     } catch (error) {
       if (error instanceof UpstreamError) throw error;
       if (signal?.aborted) throw abortFailure(signal);

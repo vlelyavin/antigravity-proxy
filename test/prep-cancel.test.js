@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config/load-config.js';
 import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/upstream-client.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 const BODY = { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'synthetic' }] };
 
 function recorder() {

@@ -17,7 +17,7 @@ const SHARED_BUDGET_REASONS = new Set([
   'rate_limit_unknown_scope', 'endpoint_unavailable', 'unknown', 'timeout', 'permission_denied',
   'model_unavailable', 'truncated', 'malformed', 'empty_response', 'unsuccessful_terminal',
   'oauth_unavailable', 'oauth_rejected', 'oauth_malformed',
-  'account_restricted', 'project_restricted', 'provider_unavailable',
+  'project_restricted', 'provider_unavailable',
 ]);
 
 function decision(failure, fields) {
@@ -36,6 +36,9 @@ function decision(failure, fields) {
     budget: 'none',
     sharedEffect: 'none',
     sharedScope: null,
+    // A scoped outcome carries the model it belongs to and the moment it expires.
+    model: failure.model ?? null,
+    until: fields.until ?? failure.retryAt ?? null,
     outcome: 'error',
     retryable: failure.retryable === true,
     headerReason: 'transient',
@@ -118,11 +121,42 @@ export function decideFailure(failure, context = {}) {
       // Request-local alternate only: no shared account/model state, no guessed owner.
       out = decision(failure, { action: 'alternate', outcome: 'rate_limited', headerReason: 'quota' });
       break;
-    case 'scoped_quota':
-      // No AGY adapter recognizes scoped quota yet; vocabulary alone is not evidence.
+    case 'scoped_quota': {
+      // Only reachable with structured evidence (QuotaFailure / quota reset metadata): park the
+      // account+model until the upstream reset time, and rotate to another account for this turn.
+      const until = Number.isFinite(failure.retryAt) ? failure.retryAt : null;
+      const scope = failure.scope === 'account_model' || failure.scope === 'account' ? failure.scope : null;
+      if (until !== null && scope !== null) {
+        out = decision(failure, {
+          action: 'alternate',
+          sharedEffect: 'restrict',
+          sharedScope: scope,
+          until,
+          outcome: 'rate_limited',
+          headerReason: 'quota',
+        });
+      } else {
+        // No usable reset/scope: stay request-local, exactly as a bare 429.
+        out = decision(failure, {
+          reason: 'rate_limit_unknown_scope',
+          scope: 'request',
+          action: 'alternate',
+          outcome: 'rate_limited',
+          headerReason: 'quota',
+        });
+      }
+      break;
+    }
+    case 'account_restricted':
+      // 403 TOS_VIOLATION / UNSUPPORTED_CLIENT: the account is gone for this generation (and for
+      // every later one until the operator clears it). Never a rate limit, never a refresh.
       out = decision(failure, {
-        reason: 'rate_limit_unknown_scope', scope: 'request', action: 'alternate',
-        outcome: 'rate_limited', headerReason: 'quota',
+        action: 'alternate',
+        sharedEffect: 'restrict_account',
+        sharedScope: 'account',
+        until: null,
+        outcome: 'tos_blocked',
+        headerReason: 'auth',
       });
       break;
     case 'egress_invalid_config':

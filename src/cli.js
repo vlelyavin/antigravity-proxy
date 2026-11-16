@@ -1,4 +1,5 @@
 import { errorCategory } from './utils/error-category.js';
+import fs from 'node:fs';
 import { loadConfig } from './config/load-config.js';
 import { createLogger } from './utils/logger.js';
 import { CredentialStore } from './credentials/credential-store.js';
@@ -10,6 +11,23 @@ import { accountLabel } from './utils/alias.js';
 const config = loadConfig();
 const logger = createLogger(config.logLevel);
 
+// Operator escape hatch: a persisted TOS block is cleared only by an explicit action.
+if (process.argv.includes('--clear-pool')) {
+  const target = AccountPool.expandStatePath(config.state?.poolPath ?? null);
+  if (!target) {
+    console.error('no state.poolPath configured');
+    process.exit(1);
+  }
+  try {
+    fs.rmSync(target, { force: true });
+    console.log(`cleared ${target}`);
+  } catch (error) {
+    console.error(`could not clear ${target}: ${error.message}`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
 const credentialStore = new CredentialStore({
   searchPaths: config.credentials.searchPaths,
   logger,
@@ -19,7 +37,7 @@ const upstream = new UpstreamClient({
   config, logger,
   currentGeneration: (account) => credentialStore.readAll().find((current) => current.id === account.id)?.generation,
 });
-const pool = new AccountPool({ logger });
+const pool = new AccountPool({ logger, statePath: config.state?.poolPath ?? null });
 
 /**
  * Start-up egress resolution: every account's exit is decided from the loaded credential set, so a
@@ -43,6 +61,8 @@ server.listen(config.listen.port, config.listen.host, () => {
   });
   if (!startup) return;
   const { accounts } = startup;
+  // the CLI's own start-up chatter (user info, quota, experiments), best effort and off the path
+  upstream.warmup(accounts).catch(() => {});
   // payload-free: the journal gets the account labels (acct-<hash>), never emails or token file
   // paths. Which credential a label belongs to is an operator question, answered on the host.
   logger.info('credentials.loaded', {

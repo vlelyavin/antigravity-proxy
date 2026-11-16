@@ -21,7 +21,7 @@ import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { accountLabel } from '../src/utils/alias.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 const KEY = fs.readFileSync(new URL('./fixtures/localhost-test-key.pem', import.meta.url));
 const CERT = fs.readFileSync(new URL('./fixtures/localhost-test-cert.pem', import.meta.url));
 

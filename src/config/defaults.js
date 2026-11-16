@@ -27,6 +27,19 @@ export const DEFAULTS = {
       const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
       return `antigravity/cli/${version} (aidev_client; os_type=${osType}; arch=${arch}; cl=${build}; auth_method=consumer)`;
     })(),
+    // Register the trajectory (writeTrajectoryAcls) before each generate call, the way the
+    // official CLI does. Off by default so a bare relay keeps its old one-POST shape; production
+    // turns it on in config.json.
+    trajectoryAcls: false,
+    // report turns to play.googleapis.com/log like the CLI does (best effort)
+    telemetry: false,
+    // call fetchUserInfo / retrieveUserQuotaSummary / listExperiments once per account at start
+    warmup: false,
+    // Replace harness/vendor identity markers ("Nous Research", "Hermes", "Claude Code",
+    // "Anthropic", …) in the system instruction before dispatch. Cloud Code answers an opaque
+    // 429 to some of them; see rewrite/identity-scrub.js. `extra` appends deployment-specific
+    // [from, to] pairs to the built-in list.
+    identityScrub: { enabled: true, extra: [] },
     requestTimeoutMs: 120_000,
     // refresh the oauth access token 5 minutes before expiry
     eagerRefreshMs: 5 * 60 * 1000,
@@ -59,9 +72,16 @@ export const DEFAULTS = {
   },
 
   rotation: {
-    // Legacy setting retained for config compatibility; the initial adapter recognizes no scoped
-    // quota evidence, so neither bare 429 nor another failure uses this account cooldown.
+    // Legacy setting retained for config compatibility; scoped quota cooldowns are driven by the
+    // upstream reset hint, not by this value.
     cooldownMs: 60_000,
+    // A structured quota failure (QuotaFailure / QUOTA_EXHAUSTED / reset metadata) parks the
+    // account+model until the upstream reset time. When the upstream gives no reset hint, this
+    // window is used instead; 0 disables the default park (a reset hint still parks).
+    quotaCooldownMs: 5 * 60 * 1000,
+    // Optional pool-wide pause after the first 403 TOS_VIOLATION (ms). 0 keeps the block on the
+    // offending credential only, like CLIProxyAPI's default `tos-pause-window: 0`.
+    tosPauseMs: 0,
     // Total budget for one request, preparation through the last fallback (ms). Mari cuts a turn
     // at 120 s, so the default sits just under it; raise it for callers that wait longer. The
     // per-attempt ladder (rotation.attemptTimeoutsMs) only shortens attempts inside this budget.
@@ -74,5 +94,11 @@ export const DEFAULTS = {
     // ...and how long it may then go between meaningful frames. Neither timer extends the request
     // deadline or the explicit ladder, and the native generateContent lane has neither (no frames).
     idleTimeoutMs: 30_000,
+  },
+
+  // Persisted pool state: scoped quota parks and TOS credential blocks survive a restart.
+  // 0600, local file only; the journal stays payload-free.
+  state: {
+    poolPath: '~/.antigravity-proxy/pool-state.json',
   },
 };

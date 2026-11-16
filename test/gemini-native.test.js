@@ -54,5 +54,5 @@ test('fileData passes through roundtrip: native -> openai marker -> antigravity 
     fileData: { fileUri: 'https://x/y.mp4', mimeType: 'video/mp4' },
     videoMetadata: { fps: 1 },
   });
-  assert.deepEqual(parts[1], { text: 'what happens' });
+  assert.match(parts[1].text, /^<USER_REQUEST>\nwhat happens\n<\/USER_REQUEST>/);
 });

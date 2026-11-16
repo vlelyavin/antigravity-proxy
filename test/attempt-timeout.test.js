@@ -9,7 +9,7 @@ import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 // fake antigravity upstream: project p-hung never answers, p-slow answers after 300 ms, others at once
 function fakeUpstream() {

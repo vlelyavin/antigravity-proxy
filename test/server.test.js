@@ -9,7 +9,7 @@ import { UpstreamClient , generationOf} from '../src/upstream/upstream-client.js
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 // fake upstream Cloud Code backend: answers generateContent and SSE stream
 function fakeUpstream() {
@@ -18,7 +18,25 @@ function fakeUpstream() {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const parsed = JSON.parse(body);
-      if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429' || parsed.project === 'p-exhausted') {
+      // writeTrajectoryAcls: no request envelope, just acknowledge
+      if (parsed.trajectoryId) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      if (parsed.project === 'p-tos') {
+        res.writeHead(403, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          error: {
+            code: 403,
+            status: 'PERMISSION_DENIED',
+            message: 'blocked',
+            details: [{ reason: 'TOS_VIOLATION', metadata: { appeal_url: 'https://forms.gle/example' } }],
+          },
+        }));
+        return;
+      }
+      if (parsed.request.contents[0].parts[0].text.includes('TRIGGER_429') || parsed.project === 'p-exhausted') {
         res.writeHead(429, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
         return;
@@ -29,7 +47,7 @@ function fakeUpstream() {
         res.write(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'y' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 2, totalTokenCount: 4 } } })}\n\n`);
         res.end();
       } else {
-        const reply = parsed.request.contents[0].parts[0].text === 'ECHO_MODEL'
+        const reply = parsed.request.contents[0].parts[0].text.includes('ECHO_MODEL')
           ? `MODEL:${parsed.model}`
           : 'pong';
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -61,7 +79,7 @@ async function startStack({ accounts, apiKey = null } = {}) {
   const server = createServer({ config, credentialStore: store, upstream: upstreamClient, pool, logger });
   await once(server.listen(0), 'listening');
   const port = server.address().port;
-  return { server, upstreamServer, port, pool };
+  return { server, upstreamServer, port, pool, upstreamClient };
 }
 
 async function post(port, path, body, headers = {}) {
@@ -163,6 +181,68 @@ test('/health reports accounts; /v1/models lists catalog', async () => {
     const models = await fetch(`http://127.0.0.1:${stack.port}/v1/models`);
     const modelsJson = await models.json();
     assert.ok(modelsJson.data.some((m) => m.id === 'gemini-3.8-flash-high'));
+  } finally {
+    stack.server.close(); stack.upstreamServer.close();
+  }
+});
+
+
+test('native streamGenerateContent emits native SSE frames and no [DONE]', async () => {
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'ns1', email: 'a@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null }] });
+  try {
+    const res = await post(stack.port, '/v1beta/models/gemini-3.8-flash:streamGenerateContent', {
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/event-stream/);
+    const text = await res.text();
+    assert.match(text, /"candidates"/);
+    assert.match(text, /"text":"he"/);
+    assert.match(text, /"text":"y"/);
+    assert.equal(text.includes('[DONE]'), false);
+  } finally {
+    stack.server.close(); stack.upstreamServer.close();
+  }
+});
+
+test('403 TOS_VIOLATION parks the account and the turn moves to the next one', async () => {
+  const stack = await startStack({
+    accounts: [
+      { generation: 'synthetic', id: 'tos1', email: 'banned@x', projectId: 'p-tos', refreshToken: 'r', accessToken: 't', expiry: null },
+      { generation: 'synthetic', id: 'tos2', email: 'alive@x', projectId: 'p', refreshToken: 'r', accessToken: 't', expiry: null },
+    ],
+  });
+  try {
+    const res = await post(stack.port, '/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.choices[0].message.content, 'hey');
+    const health = await (await fetch(`http://127.0.0.1:${stack.port}/health`)).json();
+    assert.equal(health.eligibility.status, 'restricted');
+    const block = health.eligibility.restrictions.find((r) => r.scope === 'account');
+    assert.ok(block, 'the TOS account is restricted');
+    assert.equal(block.reason, 'account_restricted');
+    assert.equal(block.until, null, 'a TOS block is permanent until the operator clears it');
+    assert.equal(JSON.stringify(block).includes('banned@x'), false);
+  } finally {
+    stack.server.close(); stack.upstreamServer.close();
+  }
+});
+
+test('/v1/quota exposes the warmup quota snapshot without identities', async () => {
+  const stack = await startStack({ accounts: [{ generation: 'synthetic', id: 'qu1', email: 'q@x', projectId: 'p' }] });
+  try {
+    stack.upstreamClient.quotaByAccount.set('qu1', {
+      at: '2026-11-16T00:00:00.000Z',
+      summary: { buckets: [{ remainingFraction: 0.5, resetTime: '2026-11-16T05:00:00Z' }] },
+    });
+    const res = await fetch(`http://127.0.0.1:${stack.port}/v1/quota`);
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.data.length, 1);
+    assert.match(json.data[0].account, /^acct-/);
+    assert.equal(json.data[0].summary.buckets[0].remainingFraction, 0.5);
+    assert.equal(JSON.stringify(json).includes('q@x'), false);
   } finally {
     stack.server.close(); stack.upstreamServer.close();
   }

@@ -29,7 +29,7 @@ test('readAll throws a helpful error when nothing found', () => {
 });
 
 test('config defaults + env override', () => {
-  const config = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '9999', ANTIGRAVITY_PROXY_API_KEY: 'sk-test' } });
+  const config = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '9999', ANTIGRAVITY_PROXY_API_KEY: 'sk-test' } });
   assert.equal(config.listen.port, 9999);
   assert.equal(config.apiKey, 'sk-test');
   assert.equal(config.upstream.baseUrl, 'https://daily-cloudcode-pa.googleapis.com');

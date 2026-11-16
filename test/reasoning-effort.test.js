@@ -7,24 +7,24 @@ const mk = (model, extra = {}) => openAiToAntigravity(
   { projectId: 'p', sessionId: 's' },
 );
 
-test('effort maps to thinkingLevel and the suffixed upstream id; no thinkingBudget', () => {
+test('effort maps to an uppercase thinkingLevel next to a zero thinkingBudget', () => {
   const low = mk('gemini-3.8-flash', { reasoning_effort: 'low' });
   assert.equal(low.model, 'gemini-3.8-flash-low');
-  assert.equal(low.request.generationConfig.thinkingConfig.thinkingLevel, 'low');
-  assert.equal(low.request.generationConfig.thinkingConfig.thinkingBudget, undefined);
+  assert.equal(low.request.generationConfig.thinkingConfig.thinkingLevel, 'LOW');
+  assert.equal(low.request.generationConfig.thinkingConfig.thinkingBudget, 0);
   assert.equal(low.request.generationConfig.thinkingConfig.includeThoughts, true);
 
-  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'medium' }).request.generationConfig.thinkingConfig.thinkingLevel, 'medium');
-  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'high' }).request.generationConfig.thinkingConfig.thinkingLevel, 'high');
+  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'medium' }).request.generationConfig.thinkingConfig.thinkingLevel, 'MEDIUM');
+  assert.equal(mk('gemini-3.8-flash', { reasoning_effort: 'high' }).request.generationConfig.thinkingConfig.thinkingLevel, 'HIGH');
 
   for (const e of ['xhigh', 'ultra', 'max']) {
-    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).request.generationConfig.thinkingConfig.thinkingLevel, 'high', `effort=${e}`);
+    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).request.generationConfig.thinkingConfig.thinkingLevel, 'HIGH', `effort=${e}`);
   }
   for (const e of ['none', 'minimal', 'off']) {
-    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).request.generationConfig.thinkingConfig.thinkingLevel, 'low', `effort=${e}`);
+    assert.equal(mk('gemini-3.8-flash', { reasoning_effort: e }).request.generationConfig.thinkingConfig.thinkingLevel, 'LOW', `effort=${e}`);
   }
   // owner rule: reasoning disabled behaves like low
-  assert.equal(mk('gemini-3.8-flash', { reasoning: { enabled: false } }).request.generationConfig.thinkingConfig.thinkingLevel, 'low');
+  assert.equal(mk('gemini-3.8-flash', { reasoning: { enabled: false } }).request.generationConfig.thinkingConfig.thinkingLevel, 'LOW');
   // no effort -> no level (provider default)
   assert.equal(mk('gemini-3.8-flash').request.generationConfig.thinkingConfig.thinkingLevel, undefined);
 });

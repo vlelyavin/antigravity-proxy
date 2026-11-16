@@ -138,7 +138,7 @@ test('dropIdleSockets closes pooled sockets and leaves in-flight ones', async ()
 });
 
 test('a pre-flight network failure retries after dropping pooled sockets', async () => {
-  const config = loadConfig({ env: { ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+  const config = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
   const client = new UpstreamClient({ currentGeneration: generationOf, config, logger: createLogger('error') });
   const order = [];
   client.agents.set('socks5://egress', { freeSockets: { 'upstream:443:': [{ destroy: () => order.push('drop') }] } });

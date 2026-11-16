@@ -16,7 +16,7 @@ import { AccountPool } from '../src/upstream/account-pool.js';
 import { handleWithRotation } from '../src/server/handlers.js';
 import { accountLabel } from '../src/utils/alias.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 const KEY = fs.readFileSync(new URL('./fixtures/localhost-test-key.pem', import.meta.url));
 const CERT = fs.readFileSync(new URL('./fixtures/localhost-test-cert.pem', import.meta.url));
 
@@ -190,6 +190,7 @@ test('a normal completion leaves no abort listener on the request signal', async
       body: '{}',
       signal,
       egressUrl: stack.egressUrl,
+      stream: true,
     });
     let text = '';
     for await (const chunk of response.body) text += chunk;

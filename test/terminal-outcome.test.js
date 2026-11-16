@@ -12,7 +12,7 @@ import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/ups
 import { createServer } from '../src/server/create-server.js';
 import { handleWithRotation, isSuccessfulTerminal } from '../src/server/handlers.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 const CONFIG_NO_FALLBACK = {
   apiKey: null,
   upstream: { requestTimeoutMs: 2000, egress: { url: null } },

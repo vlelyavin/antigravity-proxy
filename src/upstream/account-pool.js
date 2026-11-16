@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { accountLabel } from '../utils/alias.js';
 import { EVIDENCE, POLICY_VERSION, REASONS } from './failure.js';
 
@@ -49,20 +52,120 @@ function projectAlias(projectId) {
 }
 
 export class AccountPool {
-  constructor({ logger, now = () => Date.now() } = {}) {
+  constructor({ logger, now = () => Date.now(), statePath = null } = {}) {
     this.logger = logger;
     this.now = now;
+    this.statePath = AccountPool.expandStatePath(statePath);
     this.restrictions = new Map(); // key -> record (trusted internal keys may carry private ids)
     this.credentialBlocks = new Map(); // accountId -> { generation, reason, evidence, alias, revision }
     this.probes = new Map(); // key -> { owner, revision, alias, scope, account }
     this.revision = 0;
+    // Persisted scoped state survives a restart: a TOS block is not a timer, and a quota park
+    // that forgets itself on deploy is how a pool re-hits an exhausted account.
+    const restored = this.#load();
     // Inferred availability is process-local in this slice. A start is an explicit reset, not a
     // verified recovery; the operator journal keeps the decisions that led to the old state.
     this.logger?.info?.('pool.reset', {
       policyVersion: POLICY_VERSION,
-      persisted: false,
+      persisted: restored > 0,
+      restored,
       reason: 'process_start',
     });
+  }
+
+  static expandStatePath(statePath) {
+    if (typeof statePath !== 'string' || statePath === '') return null;
+    if (statePath === '~') return os.homedir();
+    if (statePath.startsWith('~/')) return path.join(os.homedir(), statePath.slice(2));
+    return statePath;
+  }
+
+  /** Reads the persisted scoped state. Unreadable or expired entries are dropped, never fatal. */
+  #load() {
+    if (!this.statePath || !fs.existsSync(this.statePath)) return 0;
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+    } catch {
+      this.logger?.warn?.('pool.state_unreadable', { policyVersion: POLICY_VERSION });
+      return 0;
+    }
+    if (!data || data.version !== 1) return 0;
+    const now = this.now();
+    let restored = 0;
+    for (const record of Array.isArray(data.restrictions) ? data.restrictions : []) {
+      if (!record || !RESTRICTION_SCOPES.has(record.scope)) continue;
+      const until = Number.isFinite(record.until) ? record.until : null;
+      if (until !== null && until <= now) continue;
+      const key = restrictionKey(record.scope, {
+        accountId: record.accountId, model: record.model, resourceKey: record.resourceKey,
+      });
+      if (!key) continue;
+      this.restrictions.set(key, {
+        scope: record.scope,
+        accountId: record.accountId ?? null,
+        alias: record.alias ?? accountLabel(record.accountId ?? 'unknown'),
+        model: record.model ?? null,
+        resourceKey: record.resourceKey ?? null,
+        resourceAlias: record.resourceAlias ?? (record.model ?? 'unknown'),
+        until,
+        reason: fixedReason(record.reason),
+        evidence: fixedEvidence(record.evidence),
+        generation: record.generation ?? null,
+        policyVersion: POLICY_VERSION,
+        revision: Number.isFinite(record.revision) ? record.revision : ++this.revision,
+        updatedAt: Number.isFinite(record.updatedAt) ? record.updatedAt : now,
+      });
+      this.revision = Math.max(this.revision, Number.isFinite(record.revision) ? record.revision : 0);
+      restored += 1;
+    }
+    for (const [accountId, block] of Object.entries(data.credentialBlocks ?? {})) {
+      if (!accountId || !block || typeof block.generation !== 'string' || block.generation === '') continue;
+      this.credentialBlocks.set(accountId, {
+        generation: block.generation,
+        reason: fixedReason(block.reason),
+        evidence: fixedEvidence(block.evidence),
+        alias: block.alias ?? accountLabel(accountId),
+        policyVersion: POLICY_VERSION,
+        revision: Number.isFinite(block.revision) ? block.revision : ++this.revision,
+      });
+      this.revision = Math.max(this.revision, Number.isFinite(block.revision) ? block.revision : 0);
+      restored += 1;
+    }
+    return restored;
+  }
+
+  /** Atomic, 0600, best effort: a state write failure must never fail the request. */
+  #persist() {
+    if (!this.statePath) return;
+    const payload = {
+      version: 1,
+      policyVersion: POLICY_VERSION,
+      savedAt: new Date(this.now()).toISOString(),
+      restrictions: [...this.restrictions.values()].map((record) => ({
+        scope: record.scope,
+        accountId: record.accountId,
+        alias: record.alias,
+        model: record.model,
+        resourceKey: record.resourceKey,
+        resourceAlias: record.resourceAlias,
+        until: record.until,
+        reason: record.reason,
+        evidence: record.evidence,
+        generation: record.generation,
+        revision: record.revision,
+        updatedAt: record.updatedAt,
+      })),
+      credentialBlocks: Object.fromEntries(this.credentialBlocks),
+    };
+    try {
+      fs.mkdirSync(path.dirname(this.statePath), { recursive: true, mode: 0o700 });
+      const tmp = `${this.statePath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+      fs.renameSync(tmp, this.statePath);
+    } catch {
+      this.logger?.warn?.('pool.state_write_failed', { policyVersion: POLICY_VERSION });
+    }
   }
 
   /** Every restriction key that the given attempt context would have to satisfy. */
@@ -288,6 +391,7 @@ export class AccountPool {
     }
     // Ownership is always released on success, including scopes whose newer evidence survived.
     this.releaseProbe(selection);
+    if (recovered.length > 0) this.#persist();
     return recovered;
   }
 
@@ -357,6 +461,7 @@ export class AccountPool {
       updatedAt: this.now(),
     };
     this.restrictions.set(key, record);
+    this.#persist();
     const effect = existing ? 'extended' : 'restricted';
     this.logger?.warn?.('pool.restriction', {
       effect,
@@ -395,6 +500,7 @@ export class AccountPool {
     this.credentialBlocks.set(id, {
       generation, reason, evidence, alias, policyVersion: POLICY_VERSION, revision: ++this.revision,
     });
+    this.#persist();
     this.logger?.warn?.('pool.restriction', {
       effect: 'credential_blocked',
       scope: 'credential',
@@ -410,7 +516,9 @@ export class AccountPool {
 
   /** Explicit operator retry: the only non-material way to unblock a generation. */
   clearCredentialBlock(accountId) {
-    return this.credentialBlocks.delete(accountId);
+    const removed = this.credentialBlocks.delete(accountId);
+    if (removed) this.#persist();
+    return removed;
   }
 
   /**

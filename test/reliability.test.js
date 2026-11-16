@@ -10,7 +10,7 @@ import { UpstreamClient, UpstreamError , generationOf} from '../src/upstream/ups
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 function fakeUpstream({ hangMs = 0, sse } = {}) {
   return http.createServer((req, res) => {
@@ -18,7 +18,13 @@ function fakeUpstream({ hangMs = 0, sse } = {}) {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const parsed = JSON.parse(body);
-      if (parsed.request.contents[0].parts[0].text === 'TRIGGER_429' || parsed.project === 'p-exhausted') {
+      // writeTrajectoryAcls: no request envelope, just acknowledge
+      if (parsed.trajectoryId) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      if (parsed.request.contents[0].parts[0].text.includes('TRIGGER_429') || parsed.project === 'p-exhausted') {
         res.writeHead(429, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }));
         return;

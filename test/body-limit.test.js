@@ -8,7 +8,7 @@ import { createLogger } from '../src/utils/logger.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer, readBody } from '../src/server/create-server.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 function echoServer(limitBytes) {
   const seen = [];

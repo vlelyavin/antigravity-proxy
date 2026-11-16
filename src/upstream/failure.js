@@ -79,6 +79,9 @@ export const EVIDENCE = Object.freeze([
   'egress_config', 'egress_dial', 'egress_handshake', 'egress_connect', 'egress_timeout',
   'dispatch_budget', 'pool_gate', 'resolved_gate', 'probe_ownership', 'credential_generation',
   'project_response', 'local_invalid_request', 'unclassified_error',
+  // Structured upstream details: a QuotaFailure/reset hint parks account+model, a TOS enum
+  // blocks the account. Both are read from error.details[], never from free text.
+  'quota_reset_hint', 'quota_failure_detail', 'error_status_tos_violation',
 ]);
 
 const ORIGIN_SET = new Set(ORIGINS);
@@ -109,13 +112,13 @@ export function legacyKind(reason) {
   switch (reason) {
     case 'rate_limit_unknown_scope':
     case 'scoped_quota':
-    case 'account_restricted':
     case 'project_restricted':
     case 'provider_unavailable':
       return 'quota';
     case 'revoked_credential':
     case 'auth_rejected':
     case 'auth_rejected_after_refresh':
+    case 'account_restricted':
     case 'permission_denied':
       return 'auth';
     case 'truncated':
@@ -191,6 +194,81 @@ export function structuredErrorStatus(text) {
   return typeof status === 'string' ? status : null;
 }
 
+/** Google RPC duration ("30s", "1.5s", "2m", "1h") -> milliseconds, or null. */
+export function parseDuration(value) {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/.exec(value.trim());
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const unit = match[2];
+  const factor = unit === 'ms' ? 1 : unit === 's' ? 1000 : unit === 'm' ? 60_000 : 3_600_000;
+  return Number.isFinite(amount) && amount > 0 ? Math.round(amount * factor) : null;
+}
+
+/**
+ * The structured `error` object of a Google RPC body: its status enum and the `details[]` list.
+ * `details[].reason`, `details[].@type`, `details[].retryDelay` and `details[].metadata` are
+ * enums and typed fields - the free-text `message` is never read.
+ */
+export function structuredErrorDetails(text) {
+  if (typeof text !== 'string' || text === '') return null;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  const error = parsed?.error;
+  if (!error || typeof error !== 'object') return null;
+  return {
+    status: typeof error.status === 'string' ? error.status : null,
+    details: Array.isArray(error.details) ? error.details.filter((d) => d && typeof d === 'object') : [],
+  };
+}
+
+// Enum values Google puts in `error.details[].reason` for a TOS/abuse stop.
+const TOS_DETAIL_REASONS = new Set(['TOS_VIOLATION', 'UNSUPPORTED_CLIENT', 'POLICY_VIOLATION']);
+// Enum values that mean "this quota is exhausted", as opposed to a transient per-request 429.
+const QUOTA_DETAIL_REASONS = new Set([
+  'QUOTA_EXHAUSTED', 'DAILY_LIMIT_EXCEEDED',
+  'INSUFFICIENT_G1_CREDITS_BALANCE', 'INSUFFICIENT_CREDITS',
+]);
+
+function tosFromDetails(details) {
+  for (const detail of details) {
+    const reason = typeof detail.reason === 'string' ? detail.reason.toUpperCase() : '';
+    if (TOS_DETAIL_REASONS.has(reason)) return { reason };
+    const meta = detail.metadata && typeof detail.metadata === 'object' ? detail.metadata : null;
+    if (meta && typeof meta.appeal_url === 'string' && meta.appeal_url !== '') {
+      return { reason: reason || 'TOS_VIOLATION' };
+    }
+  }
+  return null;
+}
+
+function quotaFromDetails(details, now) {
+  let scoped = false;
+  let retryAt = null;
+  const later = (at) => {
+    if (Number.isFinite(at) && (retryAt === null || at > retryAt)) retryAt = at;
+  };
+  for (const detail of details) {
+    const reason = typeof detail.reason === 'string' ? detail.reason.toUpperCase() : '';
+    if (QUOTA_DETAIL_REASONS.has(reason)) scoped = true;
+    const type = typeof detail['@type'] === 'string' ? detail['@type'] : '';
+    if (type.endsWith('QuotaFailure') || type.endsWith('RateLimitInfo')) scoped = true;
+    const delay = parseDuration(detail.retryDelay);
+    if (delay !== null) later(now + delay);
+    const meta = detail.metadata && typeof detail.metadata === 'object' ? detail.metadata : null;
+    if (!meta) continue;
+    for (const key of ['quotaResetTime', 'quota_reset_time', 'resetTime', 'retryAfter']) {
+      const value = meta[key];
+      if (typeof value !== 'string') continue;
+      const at = Date.parse(value);
+      if (Number.isFinite(at)) { later(at); continue; }
+      const ms = parseDuration(value);
+      if (ms !== null) later(now + ms);
+    }
+  }
+  return { scoped, retryAt };
+}
+
 function httpReason(httpStatus, structuredStatus) {
   if (structuredStatus === 'RESOURCE_EXHAUSTED' || httpStatus === 429) {
     return { reason: 'rate_limit_unknown_scope', evidence: httpStatus === 429 ? 'http_429' : 'error_status_resource_exhausted' };
@@ -220,7 +298,6 @@ function publicStatusFor(reason, observedStatus) {
   switch (reason) {
     case 'rate_limit_unknown_scope':
     case 'scoped_quota':
-    case 'account_restricted':
     case 'project_restricted':
     case 'provider_unavailable':
       return 429;
@@ -246,10 +323,11 @@ export function publicFailureText(reason) {
   switch (reason) {
     case 'rate_limit_unknown_scope':
     case 'scoped_quota':
-    case 'account_restricted':
     case 'project_restricted':
     case 'provider_unavailable':
       return 'upstream rate limited the request';
+    case 'account_restricted':
+      return 'upstream blocked this account';
     case 'auth_rejected':
     case 'revoked_credential':
       return 'upstream rejected the credential';
@@ -307,7 +385,9 @@ export class UpstreamError extends Error {
     this.status = this.publicStatus;
     this.retryable = options.retryable === true;
     this.retryAt = Number.isFinite(options.retryAt) ? options.retryAt : null;
-    this.retryAtSource = options.retryAtSource === 'retry_after' ? 'retry_after' : null;
+    this.retryAtSource = ['retry_after', 'quota_reset', 'default'].includes(options.retryAtSource)
+      ? options.retryAtSource
+      : null;
     this.accountId = options.accountId ?? null;
     this.generation = options.generation ?? null;
     this.egressKey = options.egressKey ?? null;
@@ -413,28 +493,77 @@ export function describeFailure(error) {
   };
 }
 
-function classifyHttp(status, text, accountId, headers, { embedded = false, structuredStatus = null, generation = null, observedStatus = status } = {}) {
-  const structured = structuredStatus ?? structuredErrorStatus(text);
+function classifyHttp(status, text, accountId, headers, {
+  embedded = false, structuredStatus = null, generation = null, observedStatus = status,
+  model = null, quotaCooldownMs = 0, now = Date.now(),
+} = {}) {
+  const parsed = structuredErrorDetails(text);
+  const structured = structuredStatus ?? parsed?.status ?? null;
+  const details = parsed?.details ?? [];
+
+  // A TOS/abuse stop is account-side and terminal. It is never a rate limit, never a credential
+  // refresh, and never a reason to quietly move on to the next account inside the same request.
+  const tos = (structured === 'PERMISSION_DENIED' || status === 403) ? tosFromDetails(details) : null;
+  if (tos) {
+    return new UpstreamError(publicFailureText('account_restricted'), {
+      origin: 'generation',
+      phase: embedded ? 'validation' : 'dispatch',
+      reason: 'account_restricted',
+      scope: 'account',
+      evidence: 'error_status_tos_violation',
+      observedStatus: Number.isInteger(observedStatus) ? observedStatus : null,
+      publicStatus: 502,
+      retryable: false,
+      retryAt: null,
+      accountId,
+      generation,
+      model,
+    });
+  }
+
   const picked = httpReason(status, structured);
   let evidence = picked.evidence;
   if (embedded) evidence = structured === 'RESOURCE_EXHAUSTED' ? 'embedded_error_status_resource_exhausted' : 'embedded_error';
-  const retryAt = (picked.reason === 'rate_limit_unknown_scope' || picked.reason === 'endpoint_unavailable')
-    ? parseRetryAfter(headerValue(headers, 'retry-after'))
-    : null;
-  const publicStatus = publicStatusFor(picked.reason, status);
-  return new UpstreamError(publicFailureText(picked.reason), {
+  let reason = picked.reason;
+  let scope = 'request';
+  let retryAt = null;
+  let retryAtSource = null;
+  if (reason === 'rate_limit_unknown_scope') {
+    const headerAt = parseRetryAfter(headerValue(headers, 'retry-after'), now);
+    const quota = details.length > 0 ? quotaFromDetails(details, now) : { scoped: false, retryAt: null };
+    if (quota.scoped) {
+      // Structured quota evidence: park this account+model until the upstream reset time (or the
+      // configured default window when the reset hint is missing), instead of re-hitting it on
+      // every following request.
+      reason = 'scoped_quota';
+      scope = model ? 'account_model' : 'account';
+      retryAt = quota.retryAt ?? (quotaCooldownMs > 0 ? now + quotaCooldownMs : null);
+      retryAtSource = quota.retryAt !== null ? 'quota_reset' : (retryAt !== null ? 'default' : null);
+      evidence = quota.retryAt !== null ? 'quota_reset_hint' : 'quota_failure_detail';
+    } else if (headerAt !== null) {
+      retryAt = headerAt;
+      retryAtSource = 'retry_after';
+    }
+  } else if (reason === 'endpoint_unavailable') {
+    retryAt = parseRetryAfter(headerValue(headers, 'retry-after'), now);
+    retryAtSource = retryAt === null ? null : 'retry_after';
+  }
+  const publicStatus = publicStatusFor(reason, status);
+  return new UpstreamError(publicFailureText(reason), {
     origin: 'generation',
     phase: embedded ? 'validation' : 'dispatch',
-    reason: picked.reason,
-    scope: 'request',
+    reason,
+    scope,
     evidence,
     observedStatus: Number.isInteger(observedStatus) ? observedStatus : null,
     publicStatus,
-    retryable: picked.reason === 'rate_limit_unknown_scope' || picked.reason === 'endpoint_unavailable' || picked.reason === 'unknown',
+    retryable: reason === 'rate_limit_unknown_scope' || reason === 'scoped_quota'
+      || reason === 'endpoint_unavailable' || reason === 'unknown',
     retryAt,
-    retryAtSource: retryAt === null ? null : 'retry_after',
+    retryAtSource,
     accountId,
     generation,
+    model,
   });
 }
 
@@ -442,12 +571,16 @@ function classifyHttp(status, text, accountId, headers, { embedded = false, stru
  * HTTP response status + body -> structured failure. Only `error.status` is read from the body;
  * an `invalid_grant` substring in an unrelated 400 message changes nothing.
  */
-export function upstreamErrorFrom(status, text, accountId = null, headers = null, { generation = null } = {}) {
-  return classifyHttp(status, text, accountId, headers, { generation });
+export function upstreamErrorFrom(status, text, accountId = null, headers = null, {
+  generation = null, model = null, quotaCooldownMs = 0,
+} = {}) {
+  return classifyHttp(status, text, accountId, headers, { generation, model, quotaCooldownMs });
 }
 
 /** An explicit SSE/JSON error object (bare or wrapped by the caller) -> structured failure. */
-export function upstreamErrorFromJson(error, accountId = null, { generation = null, observedStatus = null } = {}) {
+export function upstreamErrorFromJson(error, accountId = null, {
+  generation = null, observedStatus = null, model = null, quotaCooldownMs = 0,
+} = {}) {
   const code = Number.isInteger(error?.code) ? error.code : null;
   const statusName = typeof error?.status === 'string' ? error.status : null;
   const pseudo = code ?? (statusName === 'RESOURCE_EXHAUSTED' ? 429
@@ -456,7 +589,12 @@ export function upstreamErrorFromJson(error, accountId = null, { generation = nu
         : statusName === 'INVALID_ARGUMENT' ? 400
           : statusName === 'NOT_FOUND' ? 404
             : 502);
-  return classifyHttp(pseudo, null, accountId, null, { embedded: true, structuredStatus: statusName, generation, observedStatus });
+  // Re-serialize the structured object so the shared classifier can read details[] as well.
+  let text = null;
+  try { text = JSON.stringify({ error }); } catch { text = null; }
+  return classifyHttp(pseudo, text, accountId, null, {
+    embedded: true, structuredStatus: statusName, generation, observedStatus, model, quotaCooldownMs,
+  });
 }
 
 /** The caller-facing message: a fixed reason text plus the correlation reference. */

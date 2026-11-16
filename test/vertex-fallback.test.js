@@ -10,7 +10,7 @@ import { AccountPool } from '../src/upstream/account-pool.js';
 import { createServer } from '../src/server/create-server.js';
 import { isGeminiFamily, vertexModelName } from '../src/upstream/vertex-fallback.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 // fake antigravity upstream: 429 on TRIGGER_429, normal reply otherwise
 function fakeUpstream() {
@@ -19,7 +19,13 @@ function fakeUpstream() {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const parsed = JSON.parse(body);
-      if (parsed.request?.contents?.[0]?.parts?.[0]?.text === 'TRIGGER_429') {
+      // writeTrajectoryAcls: no request envelope, just acknowledge
+      if (parsed.trajectoryId) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      if (parsed.request?.contents?.[0]?.parts?.[0]?.text?.includes('TRIGGER_429')) {
         res.writeHead(429, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { code: 429, message: 'Resource exhausted', status: 'RESOURCE_EXHAUSTED' } }));
       } else {

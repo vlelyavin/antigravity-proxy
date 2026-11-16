@@ -22,7 +22,7 @@ function loadWith(t, { file = null, env = {} } = {}) {
   const previous = process.cwd();
   process.chdir(dir);
   try {
-    return loadConfig({ env: { ...ENV_ONLY, ...env } });
+    return loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ...ENV_ONLY, ...env } });
   } finally {
     process.chdir(previous);
   }

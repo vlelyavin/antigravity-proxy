@@ -9,10 +9,18 @@
       "~/.antigravity-proxy/accounts/*.json"
     ]
   },
+  "upstream": {
+    "identityScrub": { "enabled": true, "extra": [] }
+  },
   "rotation": {
     "cooldownMs": 60000,
+    "quotaCooldownMs": 300000,
+    "tosPauseMs": 0,
     "requestDeadlineMs": 110000,
     "firstMeaningfulFrameTimeoutMs": 45000,
     "idleTimeoutMs": 30000
+  },
+  "state": {
+    "poolPath": "~/.antigravity-proxy/pool-state.json"
   }
 }

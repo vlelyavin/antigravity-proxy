@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "start": "node src/cli.js",
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
     "health": "curl -sS http://127.0.0.1:8317/health"
   },
   "engines": {

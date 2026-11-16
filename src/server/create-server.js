@@ -155,6 +155,16 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
       return;
     }
 
+    // Read-only quota telemetry: the retrieveUserQuotaSummary answers collected by warmup.
+    if (req.method === 'GET' && url.pathname === '/v1/quota') {
+      if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
+      const data = typeof upstream.quotaSnapshot === 'function' ? upstream.quotaSnapshot() : [];
+      const body = JSON.stringify({ object: 'list', data });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+      res.end(body);
+      return;
+    }
+
     if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions')) {
       if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
       const call = createCallContext(req, { model: null });
@@ -205,8 +215,9 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
       return;
     }
 
-    // native Gemini generateContent (CPA parity): /v1beta/models/{model}:generateContent
-    const nativeMatch = /^(?:\/v1beta\/models\/|\/v1\/(?:beta\/)?models\/)([^/:]+):generateContent$/.exec(url.pathname);
+    // native Gemini lane (CPA parity): /v1beta/models/{model}:generateContent and
+    // :streamGenerateContent
+    const nativeMatch = /^(?:\/v1beta\/models\/|\/v1\/(?:beta\/)?models\/)([^/:]+):(generateContent|streamGenerateContent)$/.exec(url.pathname);
     if (req.method === 'POST' && nativeMatch) {
       if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
       const call = createCallContext(req, { model: null });
@@ -230,7 +241,9 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
         await handleWithRotation({
           pool, store: credentialStore, upstream, config, logger,
           openAiBody, req, res, signal: client.signal,
-          respondNative: true, attemptTimeoutsMs: attemptTimeouts(req, config), call,
+          respondNative: true,
+          nativeStream: nativeMatch[2] === 'streamGenerateContent',
+          attemptTimeoutsMs: attemptTimeouts(req, config), call,
         });
       } catch (error) {
         if (client.signal.aborted) {

@@ -329,11 +329,39 @@ export function createFlowWatchdog({ firstMeaningfulFrameMs, idleMs, onStall }) 
 }
 
 
-function applySharedEffect(pool, decision, { account, generation, context, now }) {
+function applySharedEffect(pool, decision, { account, generation, context, now, tosPauseMs = 0 }) {
   if (decision.sharedEffect === 'block_credential') {
     return pool.blockGeneration({
       account, generation, reason: decision.reason, evidence: decision.evidence,
     });
+  }
+  if (decision.sharedEffect === 'restrict') {
+    // A structured quota outcome: park exactly the account+model the upstream named.
+    if (!decision.model || !Number.isFinite(decision.until)) return { applied: false, effect: 'unknown_scope' };
+    return pool.restrict({
+      account,
+      scope: decision.sharedScope === 'account' ? 'account' : 'account_model',
+      model: decision.sharedScope === 'account' ? null : decision.model,
+      until: decision.until,
+      reason: decision.reason,
+      evidence: decision.evidence,
+      generation,
+    });
+  }
+  if (decision.sharedEffect === 'restrict_account') {
+    // TOS/abuse stop: the account stays blocked until the operator clears the pool state.
+    const applied = pool.restrict({
+      account, scope: 'account', until: null,
+      reason: decision.reason, evidence: decision.evidence, generation,
+    });
+    if (tosPauseMs > 0) {
+      // Optional pool-wide pause after the first TOS hit (CLIProxyAPI's tos-pause-window).
+      pool.restrict({
+        account, scope: 'provider', provider: 'agy', until: now + tosPauseMs,
+        reason: decision.reason, evidence: decision.evidence, generation,
+      });
+    }
+    return applied;
   }
   if (decision.sharedEffect === 'cool_egress') {
     if (!context?.egressKey) return { applied: false, effect: 'unknown_egress' };
@@ -358,7 +386,7 @@ function applySharedEffect(pool, decision, { account, generation, context, now }
  */
 export async function handleWithRotation({
   pool, store, upstream, config, logger, openAiBody, req, res, signal,
-  respondNative = false, attemptTimeoutsMs = [], call = null,
+  respondNative = false, nativeStream = false, attemptTimeoutsMs = [], call = null,
 }) {
   const ctx = call ?? createCallContext(req, { model: openAiBody.model });
   ctx.setModel(openAiBody.model);
@@ -529,8 +557,11 @@ export async function handleWithRotation({
         const dispatchOptions = {
           upstream, logger, account, openAiBody, signal: attemptSignal, timing, flow,
           requestId, call: ctx, budget, beforeDispatch, generation: attemptGeneration,
+          quotaCooldownMs: config.rotation?.quotaCooldownMs ?? 0,
         };
-        if (respondNative === true) {
+        if (respondNative === true && nativeStream === true) {
+          await handleStream({ ...dispatchOptions, res, nativeStream: true });
+        } else if (respondNative === true) {
           await handleNonStream({ ...dispatchOptions, res, respondNative: true });
         } else if (openAiBody.stream) {
           await handleStream({ ...dispatchOptions, res });
@@ -595,6 +626,7 @@ export async function handleWithRotation({
             stateEffect = generationCurrent
               ? applySharedEffect(pool, decision, {
                 account, generation: attemptGeneration, context: attemptContext, now: Date.now(),
+                tosPauseMs: config.rotation?.tosPauseMs ?? 0,
               })
               : { applied: false, effect: 'stale_generation' };
           }
@@ -998,10 +1030,14 @@ async function readJsonBody(upstreamResponse, account, generation) {
   }
 }
 
-function validateNativeBody(json, account, generation, observedStatus) {
+function validateNativeBody(json, account, generation, observedStatus, { model = null, quotaCooldownMs = 0 } = {}) {
   if (!json || typeof json !== 'object' || Array.isArray(json)) throw malformedShape(account.id, generation);
   const explicitError = explicitUpstreamError(json);
-  if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus });
+  if (explicitError) {
+    throw upstreamErrorFromJson(explicitError, account.id, {
+      generation, observedStatus, model, quotaCooldownMs,
+    });
+  }
   const wrapper = json?.response ?? json;
   const blocked = Boolean(wrapper?.promptFeedback?.blockReason) && !wrapper?.candidates?.length;
   const terminal = rawFinishReason(json);
@@ -1014,7 +1050,7 @@ function validateNativeBody(json, account, generation, observedStatus) {
 }
 
 async function collectFrames(options, shape) {
-  const { upstream, openAiBody, account, signal, model, timing, flow, generation, budget, beforeDispatch, requestId } = options;
+  const { upstream, openAiBody, account, signal, model, timing, flow, generation, budget, beforeDispatch, requestId, quotaCooldownMs } = options;
   const upstreamResponse = await upstream.generateStream({
     openAiBody, account, signal, budget, beforeDispatch, requestId,
   });
@@ -1030,7 +1066,7 @@ async function collectFrames(options, shape) {
     observeFrameShape(json, shape);
     // an upstream error object is a failure, not an empty completion - bare or wrapped
     const explicitError = explicitUpstreamError(json);
-    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status });
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status, model: openAiBody.model, quotaCooldownMs });
     const wrapper = json?.response ?? json;
     const blocked = wrapper?.promptFeedback?.blockReason && !wrapper?.candidates?.length;
     const terminal = rawFinishReason(json);
@@ -1060,7 +1096,7 @@ async function collectFrames(options, shape) {
     observeFrameShape(frame, shape);
     // an explicit upstream error is a failure, not a keepalive - bare or in the response wrapper
     const explicitError = explicitUpstreamError(frame);
-    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status });
+    if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status, model: openAiBody.model, quotaCooldownMs });
     const terminal = rawFinishReason(frame);
     if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, generation);
     const out = antigravityChunkToOpenAiChunk(frame, { model, indexRef });
@@ -1135,12 +1171,12 @@ async function collectFrames(options, shape) {
 
 async function handleNonStream({
   upstream, logger, account, openAiBody, res, signal, respondNative = false,
-  timing, flow, requestId, call, budget, beforeDispatch, generation,
+  timing, flow, requestId, call, budget, beforeDispatch, generation, quotaCooldownMs = 0,
 }) {
   if (!respondNative) {
     const openAiJson = await collectCompletion({
       upstream, logger, requestId, openAiBody, account, signal, model: openAiBody.model,
-      timing, flow, call, budget, beforeDispatch, generation,
+      timing, flow, call, budget, beforeDispatch, generation, quotaCooldownMs,
     });
     call?.syncFromBudget?.(budget);
     const body = JSON.stringify(openAiJson);
@@ -1170,7 +1206,9 @@ async function handleNonStream({
   });
   timing.prepMs = Date.now() - timing.startedAt;
   const json = await readJsonBody(upstreamResponse, account, generation);
-  const wrapper = validateNativeBody(json, account, generation, upstreamResponse.status);
+  const wrapper = validateNativeBody(json, account, generation, upstreamResponse.status, {
+    model: openAiBody.model, quotaCooldownMs,
+  });
   const { antigravityToGeminiNative } = await import('../rewrite/gemini-native.js');
   const nativeJson = antigravityToGeminiNative(json);
   call?.syncFromBudget?.(budget);
@@ -1239,7 +1277,7 @@ function reportedStreamFailure(error, accountId, generation) {
 
 async function handleStream({
   upstream, logger, account, openAiBody, res, signal, timing, flow, requestId,
-  call, budget, beforeDispatch, generation,
+  call, budget, beforeDispatch, generation, quotaCooldownMs = 0, nativeStream = false,
 }) {
   const upstreamResponse = await upstream.generateStream({
     openAiBody, account, signal, budget, beforeDispatch, requestId,
@@ -1269,10 +1307,22 @@ async function handleStream({
       try { frame = JSON.parse(payload); } catch { throw malformedFrame(account.id, generation); }
       // an explicit upstream error is a failure, not a quietly finished answer - bare or wrapped
       const explicitError = explicitUpstreamError(frame);
-      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status });
+      if (explicitError) throw upstreamErrorFromJson(explicitError, account.id, { generation, observedStatus: upstreamResponse.status, model: openAiBody.model, quotaCooldownMs });
       const terminal = rawFinishReason(frame);
       // an unsuccessful or unknown terminal must never reach the client as a clean stop
       if (terminal !== null && !isSuccessfulTerminal(terminal)) throw unsuccessfulTerminal(account.id, generation);
+      if (nativeStream) {
+        // Native Gemini SSE: the upstream frame already has the native shape (candidates /
+        // usageMetadata / promptFeedback); pass it through unchanged.
+        const nativeFrame = frame?.response ?? frame;
+        if (terminal !== null || nativeFrame?.promptFeedback?.blockReason) terminalSeen = true;
+        timing.firstFrameMs ??= Date.now() - timing.startedAt;
+        flow?.progress();
+        if (!res.write(`data: ${JSON.stringify(nativeFrame)}\n\n`)) {
+          await drainOrAbort(res, signal); // backpressure
+        }
+        continue;
+      }
       const openAiChunk = antigravityChunkToOpenAiChunk(frame, { model: openAiBody.model, indexRef });
       if (hasSignatureProgress(frame) || isMeaningfulChunk(openAiChunk)) {
         timing.firstFrameMs ??= Date.now() - timing.startedAt;
@@ -1289,7 +1339,7 @@ async function handleStream({
     // A generation ends with an explicit terminal frame. A body that just stops must not be turned
     // into a success-only [DONE]: the caller would take a truncated answer as a complete one.
     if (!terminalSeen) throw truncatedCompletion(account.id, generation);
-    res.write('data: [DONE]\n\n');
+    if (!nativeStream) res.write('data: [DONE]\n\n');
     res.end();
   } catch (error) {
     failed = error;
@@ -1304,8 +1354,13 @@ async function handleStream({
     });
     if (!res.writableEnded && !res.destroyed) {
       const message = `upstream stream failed: ${safeClientMessage(failed, requestId)}`;
-      res.write(`data: ${JSON.stringify({ error: { message, type: 'server_error' } })}\n\n`);
-      res.write('data: [DONE]\n\n');
+      if (nativeStream) {
+        // Gemini native clients expect a Google RPC error object.
+        res.write(`data: ${JSON.stringify({ error: { code: 500, message, status: 'INTERNAL' } })}\n\n`);
+      } else {
+        res.write(`data: ${JSON.stringify({ error: { message, type: 'server_error' } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      }
       res.end();
     }
     throw reportedStreamFailure(failed, account.id, generation);

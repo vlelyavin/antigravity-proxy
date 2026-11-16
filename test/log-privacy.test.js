@@ -17,7 +17,7 @@ import { AccountPool } from '../src/upstream/account-pool.js';
 import { failureReason, handleWithRotation } from '../src/server/handlers.js';
 import { createServer } from '../src/server/create-server.js';
 
-const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
+const CONFIG = loadConfig({ env: { ANTIGRAVITY_PROXY_CONFIG: 'test/fixtures/empty-config.json', ANTIGRAVITY_PROXY_PORT: '0', ANTIGRAVITY_PROXY_LOG_LEVEL: 'error' } });
 
 /** A real logger writing into an in-memory sink, so the assertions see the exact journal text. */
 function journal() {

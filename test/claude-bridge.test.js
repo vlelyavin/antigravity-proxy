@@ -4,7 +4,7 @@ import { openAiToAntigravity } from '../src/rewrite/openai-translate.js';
 
 test('anyOf in tool schemas rewrites to oneOf (Claude bridge rejects anyOf)', () => {
   const req = openAiToAntigravity({
-    model: 'claude-opus-4-6-thinking',
+    model: 'claude-opus-5-5-high',
     messages: [{ role: 'user', content: 'x' }],
     tools: [{
       type: 'function',
@@ -30,19 +30,19 @@ test('anyOf in tool schemas rewrites to oneOf (Claude bridge rejects anyOf)', ()
 
 test('bare claude alias resolves upstream id to catalog entry id', () => {
   const req = openAiToAntigravity({
-    model: 'claude-opus-4-6',
+    model: 'claude-opus-5-5',
     messages: [{ role: 'user', content: 'x' }],
     max_completion_tokens: 2000,
   }, { projectId: 'p', sessionId: 's' });
 
-  // bare alias must reach upstream as the catalog id (claude-opus-4-6-thinking),
+  // bare alias must reach upstream as the catalog id (claude-opus-5-5-high),
   // not the raw request name (was: upstream 404).
-  assert.equal(req.model, 'claude-opus-4-6-thinking');
+  assert.equal(req.model, 'claude-opus-5-5-high');
 });
 
 test('tool result carries tool_call_id into functionResponse.id', () => {
   const req = openAiToAntigravity({
-    model: 'claude-opus-4-6-thinking',
+    model: 'claude-opus-5-5-high',
     messages: [
       { role: 'user', content: 'call it' },
       { role: 'assistant', tool_calls: [{ id: 'call_test123', type: 'function', function: { name: 't', arguments: '{}' } }] },
