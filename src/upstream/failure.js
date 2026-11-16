@@ -10,7 +10,7 @@
 // but `status` is the PUBLIC mapping and `observedStatus` is the true wire status. The policy reads
 // `reason`, `scope`, `evidence`, `origin` and `phase`; it never reads a message.
 import { errorCategory } from '../utils/error-category.js';
-import { MODEL_CATALOG } from '../rewrite/models.js';
+import { MODEL_CATALOG, findModel } from '../rewrite/models.js';
 
 /** Fixed policy version carried by the journal and the `x-agy-policy` response header. */
 export const POLICY_VERSION = 'agy-rotator-1';
@@ -157,7 +157,8 @@ export function journalModel(value) {
   const bare = value.startsWith('models/') ? value.slice('models/'.length)
     : value.includes('/') ? value.slice(value.lastIndexOf('/') + 1)
       : value;
-  const hit = MODEL_CATALOG.find((entry) => entry.id === bare || entry.upstreamModel === bare);
+  const hit = MODEL_CATALOG.find((entry) => entry.id === bare || entry.upstreamModel === bare)
+    ?? findModel(bare);
   return hit ? hit.id : null;
 }
 

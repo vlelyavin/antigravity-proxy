@@ -7,7 +7,7 @@ import path from 'node:path';
 import { openAiToAntigravity } from '../src/rewrite/openai-translate.js';
 import { findModel, MODEL_CATALOG } from '../src/rewrite/models.js';
 import { scrubIdentity } from '../src/rewrite/identity-scrub.js';
-import { upstreamErrorFrom, describeFailure } from '../src/upstream/failure.js';
+import { upstreamErrorFrom, describeFailure, journalModel } from '../src/upstream/failure.js';
 import { decideFailure } from '../src/upstream/rotation-policy.js';
 import { AccountPool } from '../src/upstream/account-pool.js';
 
@@ -45,6 +45,8 @@ test('catalog drops the models Google removes on 2026-11-18 and carries their re
   assert.equal(findModel('gemini-4-argon').id, 'gemini-4-argon-high');
   assert.equal(findModel('claude-opus-5-5').id, 'claude-opus-5-5-high');
   assert.equal(findModel('gemini-3.8-flash').id, 'gemini-3.8-flash-medium');
+  assert.equal(journalModel('gemini-3.8-flash'), 'gemini-3.8-flash-medium');
+  assert.equal(journalModel('claude-opus-5-5'), 'claude-opus-5-5-high');
 });
 
 test('403 TOS_VIOLATION is classified as an account stop, not a permission blip', () => {
