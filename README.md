@@ -9,6 +9,8 @@ you have a google ai pro subscription. your tools want an openai endpoint. this 
 - reads your local antigravity/gemini oauth token from disk on every request — a fresh login elsewhere needs no restart
 - translates openai `chat/completions` ↔ cloud code `generateContent` structurally, both directions, including tool calls and images
 - streams: openai SSE out of the cloud-code SSE frames, and the native Gemini `:streamGenerateContent` lane passes the upstream frames through
+- speaks four front doors over one execution path: OpenAI chat, OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`) and a stateless MCP facade (`POST /mcp`, `ask_model` / `list_models`)
+- serves image generation through `POST /v1/images/generations`: the upstream `gemini-3.1-flash-image` answer is returned as `b64_json`; in chat the picture also arrives as a data-URI markdown fallback
 - scrubs harness identity from the system instruction (`Nous Research`, `Hermes`, `Claude Code`, `Anthropic`, …) before dispatch: cloud code answers an opaque 429 to some of those markers
 - structural quota evidence (a `QuotaFailure` / `QUOTA_EXHAUSTED` enum or a reset timestamp in `error.details[]`) parks that account+model until the upstream reset time instead of re-hitting it
 - a `403 TOS_VIOLATION` / `UNSUPPORTED_CLIENT` parks the account until an operator clears it, and the turn moves to another account; scoped state survives a restart
@@ -217,9 +219,10 @@ src/
   credentials/    token file lookup (agy / gemini-cli / raw), oauth refresh
   rewrite/        openai <-> cloud-code transforms, model catalog, identity scrub
   upstream/       cloud-code client, structured failure/policy, scoped pool
-  server/         http surface: /health, /v1/models, /v1/quota,
-                  /v1/chat/completions, /v1beta/models/{model}:{generateContent,streamGenerateContent}
-test/             node:test suite, no network needed (one local cert fixture)
+  server/         http surface: /health, /v1/models, /v1/quota, /v1/chat/completions,
+                  /v1/messages, /v1/responses, /v1/images/generations, /mcp,
+                  /v1beta/models/{model}:{generateContent,streamGenerateContent}
+test/             273 tests, node:test, no network needed (one local cert fixture)
 ```
 
 ## security

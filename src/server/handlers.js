@@ -1083,6 +1083,7 @@ async function collectFrames(options, shape) {
   let blocked = null;
   let finishReason = null;
   let usage = null;
+  const images = [];
 
   // A line is an explicit upstream error, a keepalive with nothing usable, or a delta.
   // Malformed JSON used to be skipped, which turned a broken stream into a successful empty
@@ -1114,6 +1115,7 @@ async function collectFrames(options, shape) {
     if (typeof delta.content === 'string') content += delta.content;
     if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
     if (typeof delta.refusal === 'string' && delta.refusal !== '') blocked = delta.refusal;
+    if (Array.isArray(delta.images)) images.push(...delta.images);
     for (const call of delta.tool_calls || []) {
       const slot = toolCalls.get(call.index) || { id: '', type: 'function', name: '', arguments: '' };
       if (call.id) slot.id = call.id;
@@ -1137,7 +1139,7 @@ async function collectFrames(options, shape) {
   // A normal EOF may still fail terminal validation; keep it distinct from a failed read/parse.
   shape.endClass = 'clean';
 
-  if (id === null && !content && !reasoning && toolCalls.size === 0) {
+  if (id === null && !content && !reasoning && toolCalls.size === 0 && images.length === 0) {
     throw emptyStream(account.id, generation);
   }
   // A finished generation always carries a finishReason. Without one the body was cut short:
@@ -1149,6 +1151,7 @@ async function collectFrames(options, shape) {
   const message = { role: 'assistant', content: content || (toolCalls.size ? null : '') };
   if (blocked) message.refusal = blocked;
   if (reasoning) message.reasoning_content = reasoning;
+  if (images.length > 0) message.images = images;
   if (toolCalls.size) {
     message.tool_calls = [...toolCalls.entries()]
       .sort((a, b) => a[0] - b[0])

@@ -9,6 +9,8 @@
 - Перечитывает локальный OAuth-токен Antigravity/Gemini с диска на каждый запрос: свежая авторизация подхватывается без перезапуска.
 - Структурно транслирует OpenAI `chat/completions` ↔ Cloud Code `generateContent` в обе стороны, включая вызовы инструментов и изображения.
 - Стримит: OpenAI SSE из кадров Cloud Code, а нативный `:streamGenerateContent` отдаёт кадры апстрима как есть.
+- Отдаёт четыре входные поверхности через один путь исполнения: OpenAI chat, OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`) и stateless MCP-фасад (`POST /mcp`, `ask_model` / `list_models`).
+- Генерирует картинки через `POST /v1/images/generations`: ответ апстримной `gemini-3.1-flash-image` возвращается как `b64_json`; в chat картинка дополнительно приходит markdown-ссылкой с data-URI.
 - Вычищает маркеры харнесса из system instruction (`Nous Research`, `Hermes`, `Claude Code`, `Anthropic` и другие) перед отправкой: Cloud Code отвечает непрозрачным 429 на некоторые из них.
 - Структурная квота: ответ с `QuotaFailure` / `QUOTA_EXHAUSTED` или временем сброса в `error.details[]` паркует аккаунт и модель до этого сброса, а не долбит их каждым следующим запросом.
 - `403 TOS_VIOLATION` / `UNSUPPORTED_CLIENT` паркует аккаунт до действия оператора, а запрос уходит на следующий; scoped-состояние переживает рестарт.
@@ -166,8 +168,9 @@ src/
   rewrite/        openai <-> cloud code трансформы, каталог моделей, identity scrub
   upstream/       клиент cloud code, структурные отказы/политика, scoped-пул
   server/         http: /health, /v1/models, /v1/quota, /v1/chat/completions,
+                  /v1/messages, /v1/responses, /v1/images/generations, /mcp,
                   /v1beta/models/{model}:{generateContent,streamGenerateContent}
-test/             261 тест, без сети (один локальный cert fixture)
+test/             273 теста, без сети (один локальный cert fixture)
 ```
 
 ## Безопасность

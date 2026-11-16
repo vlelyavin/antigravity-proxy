@@ -1,5 +1,8 @@
 import http from 'node:http';
 import { checkApiKey, errorResponse, failureReason, handleWithRotation } from './handlers.js';
+import {
+  handleAnthropicLane, handleAnthropicCountTokens, handleResponsesLane, handleImagesLane, handleMcpLane,
+} from './alt-lanes.js';
 import { modelsPayload } from '../rewrite/models.js';
 import { UpstreamError } from '../upstream/upstream-client.js';
 import { POLICY_VERSION, describeFailure, safeClientMessage } from '../upstream/failure.js';
@@ -209,6 +212,46 @@ export function createServer({ config, credentialStore, upstream, pool, logger }
           errorResponse(res, status, safeClientMessage(error, call.requestId), type,
             retryHeaders(call.headers(), error, logger));
         } else res.end();
+      } finally {
+        client.stop();
+      }
+      return;
+    }
+
+    // Alternate wire lanes share the same execution path as chat: Anthropic Messages, OpenAI
+    // Responses, OpenAI Images and the stateless MCP facade.
+    if (req.method === 'POST' && (url.pathname === '/v1/messages'
+      || url.pathname === '/v1/messages/count_tokens'
+      || url.pathname === '/v1/responses'
+      || url.pathname === '/v1/images/generations'
+      || url.pathname === '/mcp')) {
+      if (!checkApiKey(config, req)) return errorResponse(res, 401, 'invalid api key', 'authentication_error');
+      const call = createCallContext(req, { model: null });
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, res, undefined, call.headers()));
+      } catch (error) {
+        if (error.tooLarge || error.clientAborted) return;
+        return errorResponse(res, 400, 'invalid JSON body', 'invalid_request_error', call.headers());
+      }
+      call.setModel(body?.model ?? null);
+      const client = watchClientGone(res);
+      const shared = {
+        pool, store: credentialStore, upstream, config, logger, body, req, res,
+        signal: client.signal, attemptTimeoutsMs: attemptTimeouts(req, config),
+      };
+      try {
+        if (url.pathname === '/v1/messages/count_tokens') {
+          handleAnthropicCountTokens({ body, res });
+        } else if (url.pathname === '/v1/messages') {
+          await handleAnthropicLane(shared);
+        } else if (url.pathname === '/v1/responses') {
+          await handleResponsesLane(shared);
+        } else if (url.pathname === '/v1/images/generations') {
+          await handleImagesLane(shared);
+        } else {
+          await handleMcpLane(shared);
+        }
       } finally {
         client.stop();
       }

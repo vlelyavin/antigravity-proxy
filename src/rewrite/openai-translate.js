@@ -389,12 +389,19 @@ export function antigravityToOpenAi(respJson, { model, stream = false }) {
   let text = '';
   let reasoning = '';
   const toolCalls = [];
+  const images = [];
   let usageIn = null, usageOut = null, usageThink = null;
 
   for (const part of parts) {
     if (typeof part.text === 'string') {
       if (part.thought === true) reasoning += part.text; // thinking -> reasoning_content
       else text += part.text;
+    }
+    if (part.inlineData?.data) {
+      images.push({
+        mimeType: part.inlineData.mimeType ?? 'image/png',
+        data: part.inlineData.data,
+      });
     }
     if (part.functionCall?.name) {
       toolCalls.push({
@@ -417,6 +424,14 @@ export function antigravityToOpenAi(respJson, { model, stream = false }) {
   if (toolCalls.length > 0) {
     message.tool_calls = toolCalls;
     if (message.content === null && toolCalls.length > 0) message.content = null;
+  }
+  if (images.length > 0) {
+    // Non-standard extra field (clients ignore it) plus a markdown fallback so a chat UI shows
+    // the picture instead of an empty message. /v1/images/generations reads `images` directly.
+    message.images = images;
+    if (message.content === null) {
+      message.content = images.map((image) => `![image](data:${image.mimeType};base64,${image.data})`).join('\n');
+    }
   }
   return {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -451,10 +466,14 @@ export function antigravityChunkToOpenAiChunk(frameJson, { model, indexRef }) {
   let text = '';
   let reasoning = '';
   const toolCalls = [];
+  const images = [];
   for (const part of parts) {
     if (typeof part.text === 'string') {
       if (part.thought === true) reasoning += part.text; // thinking -> reasoning_content
       else text += part.text;
+    }
+    if (part.inlineData?.data) {
+      images.push({ mimeType: part.inlineData.mimeType ?? 'image/png', data: part.inlineData.data });
     }
     if (part.functionCall?.name) {
       toolCalls.push({
@@ -467,7 +486,7 @@ export function antigravityChunkToOpenAiChunk(frameJson, { model, indexRef }) {
     }
   }
   const blocked = promptBlock(wrapper);
-  if (text === '' && reasoning === '' && toolCalls.length === 0 && !candidate.finishReason && !blocked) return null;
+  if (text === '' && reasoning === '' && toolCalls.length === 0 && images.length === 0 && !candidate.finishReason && !blocked) return null;
 
   const delta = {};
   if (indexRef.first) {
@@ -476,6 +495,12 @@ export function antigravityChunkToOpenAiChunk(frameJson, { model, indexRef }) {
   }
   if (text !== '') delta.content = text;
   if (reasoning !== '') delta.reasoning_content = reasoning;
+  if (images.length > 0) {
+    delta.images = images;
+    if (text === '') {
+      delta.content = images.map((image) => `![image](data:${image.mimeType};base64,${image.data})`).join('\n');
+    }
+  }
   if (toolCalls.length > 0) delta.tool_calls = toolCalls;
   if (blocked) delta.refusal = blocked;
   const finishReason = blocked ? 'content_filter' : (candidate.finishReason ? (STOP_MAP[candidate.finishReason] ?? 'stop') : null);
